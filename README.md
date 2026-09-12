@@ -199,6 +199,25 @@ python scripts/run_eval.py --eval-set tests/eval/eval_set.json --threshold 0.70
 
 ---
 
+## 🔐 Multi-Tenant Auth & Bring-Your-Own-Database (BYODB)
+
+The system supports multi-tenant isolation, user authentication, and secure dynamic database connections:
+
+1. **User Accounts & Authentication**:
+   - Register via `POST /auth/register` and login via `POST /auth/login` to obtain JWT bearer access tokens.
+   - Secure password hashing with `passlib` (bcrypt).
+2. **Symmetric Encryption at Rest**:
+   - Connection strings containing database passwords are encrypted at rest using AES/Fernet encryption (`ENCRYPTION_KEY`). Decrypted credentials are never logged or exposed.
+3. **Bring-Your-Own-Database (`POST /connections`)**:
+   - Users can connect any SQL database (PostgreSQL, SQLite, MySQL, Snowflake).
+   - **Connection-Time Validation**: The system validates connectivity and executes a lightweight test query (`SELECT 1`) upon creation. Unreachable or invalid databases are rejected with clear error messages.
+   - **Write-Probe Safety Warning**: Probes database permissions on registration. If write privileges are detected, the system issues a plain safety recommendation advising the use of a read-only user without blocking execution.
+4. **Per-Connection Isolated Grounding**:
+   - Schema indexes, profiled low-cardinality value hints, and few-shot golden queries are strictly namespaced by `connection_id` in `vector_cache/connections/{connection_id}/`.
+   - Complete tenant isolation: User A's queries and schema data are never leaked or accessible to User B.
+
+---
+
 ## 🔌 Multi-LLM Router & Fallback Chain
 
 The system includes a resilient multi-provider LLM router supporting priority ordering and automatic failover across major models:
@@ -215,7 +234,7 @@ The system includes a resilient multi-provider LLM router supporting priority or
 
 ## 🧪 Testing
 
-Run the test suite with pytest (41 unit & integration tests):
+Run the test suite with pytest (46 unit & integration tests):
 ```bash
 pytest -v -o asyncio_mode=auto
 ```

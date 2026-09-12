@@ -22,6 +22,12 @@ if "session_id" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "auth_token" not in st.session_state:
+    st.session_state.auth_token = ""
+
+if "selected_connection_id" not in st.session_state:
+    st.session_state.selected_connection_id = None
+
 
 def check_backend_health():
     try:
@@ -33,12 +39,36 @@ def check_backend_health():
         return None
 
 
-def send_query_to_backend(question: str, session_id: str):
+def fetch_user_connections(auth_token: str):
+    if not auth_token:
+        return []
+    try:
+        headers = {"Authorization": f"Bearer {auth_token.strip()}"}
+        resp = httpx.get(f"{API_BASE_URL}/connections", headers=headers, timeout=5.0)
+        if resp.status_code == 200:
+            return resp.json()
+        return []
+    except Exception:
+        return []
+
+
+def send_query_to_backend(question: str, session_id: str, connection_id: Optional[str] = None, auth_token: Optional[str] = None):
     try:
         payload = {"question": question, "session_id": session_id}
-        resp = httpx.post(f"{API_BASE_URL}/ask", json=payload, timeout=60.0)
+        if connection_id:
+            payload["connection_id"] = connection_id
+
+        headers = {}
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token.strip()}"
+
+        resp = httpx.post(f"{API_BASE_URL}/ask", json=payload, headers=headers, timeout=60.0)
         if resp.status_code == 200:
             return resp.json(), None
+        elif resp.status_code == 401:
+            return None, "Authentication required (HTTP 401). Please enter a valid JWT token in the sidebar."
+        elif resp.status_code == 403:
+            return None, "Access denied (HTTP 403) for the specified database connection."
         elif resp.status_code == 429:
             return None, "Rate limit exceeded (HTTP 429). Please wait a moment before sending another query."
         else:
@@ -61,6 +91,36 @@ with st.sidebar:
     else:
         st.error("🔴 Backend Offline (http://localhost:8000)")
         st.caption("Start with: `uvicorn app.main:app --reload --port 8000`")
+
+    st.divider()
+
+    # Multi-Tenant Auth & BYODB Section
+    st.subheader("🔐 Multi-Tenant Authentication")
+    jwt_input = st.text_input(
+        "JWT Bearer Token",
+        value=st.session_state.auth_token,
+        type="password",
+        help="Paste your JWT token from POST /auth/login or /auth/register",
+    )
+    if jwt_input != st.session_state.auth_token:
+        st.session_state.auth_token = jwt_input
+        st.rerun()
+
+    # Connection Picker
+    connections = fetch_user_connections(st.session_state.auth_token)
+    if connections:
+        conn_options = {f"{c['nickname']} ({c['dialect']})": c["id"] for c in connections}
+        selected_label = st.selectbox("Select Database Connection", options=list(conn_options.keys()))
+        st.session_state.selected_connection_id = conn_options.get(selected_label)
+        selected_conn = next((c for c in connections if c["id"] == st.session_state.selected_connection_id), None)
+        if selected_conn and not selected_conn.get("is_read_only", True):
+            st.warning("⚠️ Connection has write privileges. Read-only user recommended.")
+    else:
+        st.session_state.selected_connection_id = None
+        if st.session_state.auth_token:
+            st.caption("No registered connections found. Using default server database.")
+        else:
+            st.caption("Running in default server mode (or enter token to use BYODB).")
 
     st.divider()
 
@@ -181,7 +241,12 @@ if user_input:
     # 2. Query Agent Backend with spinner
     with st.chat_message("assistant"):
         with st.spinner("Analyzing schema, planning query, and executing safely..."):
-            response_data, error_msg = send_query_to_backend(user_input, st.session_state.session_id)
+            response_data, error_msg = send_query_to_backend(
+                question=user_input,
+                session_id=st.session_state.session_id,
+                connection_id=st.session_state.selected_connection_id,
+                auth_token=st.session_state.auth_token,
+            )
 
         if error_msg:
             st.error(error_msg)

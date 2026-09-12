@@ -3,17 +3,17 @@ import logging
 import math
 import os
 import re
+import shutil
 from typing import Any, Dict, List, Optional, Tuple, Union
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 from app.config import settings
 from app.db import readonly_engine
 
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = "vector_cache"
-SCHEMA_INDEX_PATH = os.path.join(CACHE_DIR, "schema_index.json")
-GOLDEN_INDEX_PATH = os.path.join(CACHE_DIR, "golden_index.json")
-VALUE_HINTS_PATH = os.path.join(CACHE_DIR, "value_hints.json")
+CACHE_BASE_DIR = "vector_cache"
+CACHE_DIR = CACHE_BASE_DIR
 GOLDEN_QUERIES_FILE = "data/golden_queries.json"
 
 DEFAULT_TABLE_SCHEMAS = {
@@ -39,7 +39,7 @@ DEFAULT_TABLE_SCHEMAS = {
     },
     "order_items": {
         "description": "Line items for orders linking products to orders with unit price, ordered quantity, and discount percentages.",
-        "ddl": "Table: order_items (\n    order_id INTEGER REFERENCES orders(order_id),\n    product_id INTEGER REFERENCES products(product_id),\n    unit_price NUMERIC(10, 2),\n    quantity INTEGER,\n    discount NUMERIC(4, 2) (sample values: 0.0, 0.05, 0.1, 0.15, 0.2),\n    PRIMARY KEY (order_id, product_id)\n)",
+        "ddl": "Table: order_items (\n    order_id REFERENCES orders(order_id),\n    product_id INTEGER REFERENCES products(product_id),\n    unit_price NUMERIC(10, 2),\n    quantity INTEGER,\n    discount NUMERIC(4, 2) (sample values: 0.0, 0.05, 0.1, 0.15, 0.2),\n    PRIMARY KEY (order_id, product_id)\n)",
     },
 }
 
@@ -109,39 +109,52 @@ def dense_cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
 
 
 class RetrievalIndex:
-    """Manages structural schema-linking and golden query retrieval via keyword vectors or OpenAI dense embeddings."""
+    """
+    Manages structural schema-linking, value hinting, and golden query retrieval.
+    Scoped per connection_id (or global default).
+    """
 
-    def __init__(self):
+    def __init__(self, connection_id: Optional[str] = None):
+        self.connection_id = connection_id
+        if connection_id:
+            self.cache_dir = os.path.join(CACHE_BASE_DIR, "connections", connection_id)
+        else:
+            self.cache_dir = CACHE_BASE_DIR
+
+        self.schema_index_path = os.path.join(self.cache_dir, "schema_index.json")
+        self.golden_index_path = os.path.join(self.cache_dir, "golden_index.json")
+        self.value_hints_path = os.path.join(self.cache_dir, "value_hints.json")
+
         self.schema_index: Dict[str, dict] = {}
         self.golden_index: List[dict] = []
         self.value_hints: Dict[str, Dict[str, List[Any]]] = {}
         self._load_cached_indexes()
 
     def _load_cached_indexes(self):
-        """Loads index metadata from cache or initializes defaults."""
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        if os.path.exists(VALUE_HINTS_PATH):
+        """Loads index metadata from connection-specific cache or initializes defaults."""
+        os.makedirs(self.cache_dir, exist_ok=True)
+        if os.path.exists(self.value_hints_path):
             try:
-                with open(VALUE_HINTS_PATH, "r", encoding="utf-8") as f:
+                with open(self.value_hints_path, "r", encoding="utf-8") as f:
                     self.value_hints = json.load(f)
             except Exception as e:
-                logger.warning(f"Failed to load value hints: {e}")
+                logger.warning(f"Failed to load value hints for {self.connection_id}: {e}")
 
-        if os.path.exists(SCHEMA_INDEX_PATH):
+        if os.path.exists(self.schema_index_path):
             try:
-                with open(SCHEMA_INDEX_PATH, "r", encoding="utf-8") as f:
+                with open(self.schema_index_path, "r", encoding="utf-8") as f:
                     self.schema_index = json.load(f)
             except Exception as e:
-                logger.warning(f"Failed to load schema index: {e}")
+                logger.warning(f"Failed to load schema index for {self.connection_id}: {e}")
         else:
             self._build_default_schema_index()
 
-        if os.path.exists(GOLDEN_INDEX_PATH):
+        if os.path.exists(self.golden_index_path):
             try:
-                with open(GOLDEN_INDEX_PATH, "r", encoding="utf-8") as f:
+                with open(self.golden_index_path, "r", encoding="utf-8") as f:
                     self.golden_index = json.load(f)
             except Exception as e:
-                logger.warning(f"Failed to load golden index: {e}")
+                logger.warning(f"Failed to load golden index for {self.connection_id}: {e}")
         else:
             self._build_default_golden_index()
 
@@ -185,35 +198,69 @@ class RetrievalIndex:
             except Exception as e:
                 logger.warning(f"Failed to build golden index: {e}")
 
-    async def build_schema_index_from_db(self) -> Dict[str, dict]:
-        os.makedirs(CACHE_DIR, exist_ok=True)
+    async def build_schema_index_from_engine(self, engine: AsyncEngine, dialect: str = "postgres") -> Dict[str, dict]:
+        """Inspects database tables, profiles low-cardinality values, and indexes schema for this connection."""
+        os.makedirs(self.cache_dir, exist_ok=True)
         schema_data: Dict[str, dict] = {}
+        self.value_hints = {}
 
         try:
-            async with readonly_engine.connect() as conn:
-                query = text("""
-                    SELECT 
-                        t.table_name, 
-                        c.column_name, 
-                        c.data_type
-                    FROM information_schema.tables t
-                    JOIN information_schema.columns c ON t.table_name = c.table_name
-                    WHERE t.table_schema = 'public'
-                    ORDER BY t.table_name, c.ordinal_position;
-                """)
-                rows = (await conn.execute(query)).fetchall()
-                if not rows:
-                    self._build_default_schema_index()
-                    return self.schema_index
+            async with engine.connect() as conn:
+                if "sqlite" in dialect.lower() or "sqlite" in str(engine.url).lower():
+                    # SQLite schema inspection
+                    table_rows = (await conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))).fetchall()
+                    table_names = [r[0] for r in table_rows]
+                    tables_cols: Dict[str, List[str]] = {}
+                    for t_name in table_names:
+                        col_info = (await conn.execute(text(f"PRAGMA table_info('{t_name}')"))).fetchall()
+                        for c in col_info:
+                            c_name = c[1]
+                            c_type = c[2] or "TEXT"
+                            # Profile distinct values
+                            try:
+                                val_rows = (await conn.execute(text(f"SELECT DISTINCT {c_name} FROM {t_name} WHERE {c_name} IS NOT NULL LIMIT 30"))).fetchall()
+                                distinct_vals = [r[0] for r in val_rows]
+                                if 0 < len(distinct_vals) <= 25:
+                                    self.value_hints.setdefault(t_name, {})[c_name] = distinct_vals
+                                    formatted = ", ".join([f"'{s}'" if isinstance(s, str) else str(s) for s in distinct_vals[:8]])
+                                    hint_str = f" (sample values: {formatted})"
+                                else:
+                                    hint_str = ""
+                            except Exception:
+                                hint_str = ""
+                            tables_cols.setdefault(t_name, []).append(f"    {c_name} {c_type}{hint_str}")
+                else:
+                    # Postgres / ANSI Information Schema
+                    query = text("""
+                        SELECT 
+                            t.table_name, 
+                            c.column_name, 
+                            c.data_type
+                        FROM information_schema.tables t
+                        JOIN information_schema.columns c ON t.table_name = c.table_name
+                        WHERE t.table_schema = 'public'
+                        ORDER BY t.table_name, c.ordinal_position;
+                    """)
+                    rows = (await conn.execute(query)).fetchall()
+                    if not rows:
+                        self._build_default_schema_index()
+                        return self.schema_index
 
-                tables_cols: Dict[str, List[str]] = {}
-                for table_name, col_name, data_type in rows:
-                    hint_str = ""
-                    if table_name in self.value_hints and col_name in self.value_hints[table_name]:
-                        samples = self.value_hints[table_name][col_name]
-                        formatted_samples = ", ".join([f"'{s}'" if isinstance(s, str) else str(s) for s in samples[:8]])
-                        hint_str = f" (sample values: {formatted_samples})"
-                    tables_cols.setdefault(table_name, []).append(f"    {col_name} {data_type}{hint_str}")
+                    tables_cols: Dict[str, List[str]] = {}
+                    for table_name, col_name, data_type in rows:
+                        # Value profiling for low-cardinality columns
+                        hint_str = ""
+                        try:
+                            if "char" in data_type.lower() or "text" in data_type.lower() or "bool" in data_type.lower():
+                                val_rows = (await conn.execute(text(f'SELECT DISTINCT "{col_name}" FROM "{table_name}" WHERE "{col_name}" IS NOT NULL LIMIT 30'))).fetchall()
+                                distinct_vals = [r[0] for r in val_rows]
+                                if 0 < len(distinct_vals) <= 25:
+                                    self.value_hints.setdefault(table_name, {})[col_name] = distinct_vals
+                                    formatted = ", ".join([f"'{s}'" if isinstance(s, str) else str(s) for s in distinct_vals[:8]])
+                                    hint_str = f" (sample values: {formatted})"
+                        except Exception:
+                            pass
+                        tables_cols.setdefault(table_name, []).append(f"    {col_name} {data_type}{hint_str}")
 
                 for t_name, col_lines in tables_cols.items():
                     ddl = f"Table: {t_name} (\n" + ",\n".join(col_lines) + "\n)"
@@ -233,18 +280,24 @@ class RetrievalIndex:
                     }
 
                 self.schema_index = schema_data
-                with open(SCHEMA_INDEX_PATH, "w", encoding="utf-8") as f:
+                with open(self.schema_index_path, "w", encoding="utf-8") as f:
                     json.dump(schema_data, f, indent=2)
+                with open(self.value_hints_path, "w", encoding="utf-8") as f:
+                    json.dump(self.value_hints, f, indent=2)
 
         except Exception as e:
-            logger.warning(f"Could not connect to DB for schema indexing: {e}. Using defaults.")
+            logger.warning(f"Could not connect to DB for schema indexing ({self.connection_id}): {e}. Using defaults.")
             self._build_default_schema_index()
 
         return self.schema_index
 
+    async def build_schema_index_from_db(self) -> Dict[str, dict]:
+        """Backward compatible helper using readonly_engine."""
+        return await self.build_schema_index_from_engine(readonly_engine, settings.SQL_DIALECT)
+
     def build_golden_index(self) -> List[dict]:
         self._build_default_golden_index()
-        with open(GOLDEN_INDEX_PATH, "w", encoding="utf-8") as f:
+        with open(self.golden_index_path, "w", encoding="utf-8") as f:
             json.dump(self.golden_index, f, indent=2)
         return self.golden_index
 
@@ -303,13 +356,32 @@ class RetrievalIndex:
         return [item[1] for item in scores[:top_k]]
 
 
-# Global instance & helper functions
-retrieval_index = RetrievalIndex()
+# In-memory index registry
+_connection_indexes: Dict[str, RetrievalIndex] = {}
+default_retrieval_index = RetrievalIndex()
+retrieval_index = default_retrieval_index
 
 
-def relevant_schema(question: str, top_k: int = 6) -> str:
-    return retrieval_index.relevant_schema(question, top_k=top_k)
+def get_retrieval_index(connection_id: Optional[str] = None) -> RetrievalIndex:
+    """Returns the namespaced RetrievalIndex for a connection, or the default index."""
+    if not connection_id:
+        return default_retrieval_index
+    if connection_id not in _connection_indexes:
+        _connection_indexes[connection_id] = RetrievalIndex(connection_id=connection_id)
+    return _connection_indexes[connection_id]
 
 
-def retrieve_golden_queries(question: str, top_k: int = 2) -> List[dict]:
-    return retrieval_index.retrieve_golden_queries(question, top_k=top_k)
+def delete_connection_retrieval_index(connection_id: str) -> None:
+    """Removes cached index from memory and disk for a deleted connection."""
+    _connection_indexes.pop(connection_id, None)
+    dir_path = os.path.join(CACHE_BASE_DIR, "connections", connection_id)
+    if os.path.exists(dir_path):
+        shutil.rmtree(dir_path, ignore_errors=True)
+
+
+def relevant_schema(question: str, top_k: int = 6, connection_id: Optional[str] = None) -> str:
+    return get_retrieval_index(connection_id).relevant_schema(question, top_k=top_k)
+
+
+def retrieve_golden_queries(question: str, top_k: int = 2, connection_id: Optional[str] = None) -> List[dict]:
+    return get_retrieval_index(connection_id).retrieve_golden_queries(question, top_k=top_k)

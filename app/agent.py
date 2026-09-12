@@ -12,6 +12,8 @@ from app.memory import memory_store
 from app.retrieval import relevant_schema, retrieve_golden_queries, DEFAULT_TABLE_SCHEMAS
 from app.validator import validate_and_normalize_sql
 
+from app.connections import get_engine_for_connection
+
 SAMPLE_SCHEMA = "\n\n".join([d["ddl"] for d in DEFAULT_TABLE_SCHEMAS.values()])
 
 logger = logging.getLogger(__name__)
@@ -41,19 +43,22 @@ async def plan(
     few_shot_examples: Optional[List[dict]] = None,
     conversation_history: Optional[str] = None,
     error_context: Optional[str] = None,
+    dialect: Optional[str] = None,
+    connection_id: Optional[str] = None,
 ) -> dict:
     """Step 1: Calls LLM with conversation history, dialect enforcement, schema, and few-shot examples."""
+    target_dialect = (dialect or settings.SQL_DIALECT).lower()
     if not schema:
         # Combine question with conversation history for better schema retrieval on follow-ups
         retrieval_query = f"{conversation_history or ''} {question}".strip()
-        schema = relevant_schema(retrieval_query, top_k=5)
+        schema = relevant_schema(retrieval_query, top_k=5, connection_id=connection_id)
 
     if few_shot_examples is None:
-        few_shot_examples = retrieve_golden_queries(question, top_k=2)
+        few_shot_examples = retrieve_golden_queries(question, top_k=2, connection_id=connection_id)
 
-    system_prompt = f"""You are an expert SQL engineer. Your target database dialect is strictly {settings.SQL_DIALECT.upper()}.
+    system_prompt = f"""You are an expert SQL engineer. Your target database dialect is strictly {target_dialect.upper()}.
 CRITICAL SAFETY & DIALECT INSTRUCTIONS:
-- You MUST produce syntactically valid {settings.SQL_DIALECT.upper()} SQL queries.
+- You MUST produce syntactically valid {target_dialect.upper()} SQL queries.
 - Do NOT use constructs from other dialects (e.g., do NOT use SQL Server 'TOP n' or 'DATEDIFF', do NOT use Oracle 'NVL').
 - Generate ONLY read-only SELECT or WITH ... SELECT queries.
 - NEVER generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, GRANT, REVOKE, or administrative commands.
@@ -63,7 +68,7 @@ CRITICAL SAFETY & DIALECT INSTRUCTIONS:
 Output Format JSON:
 {{
   "reasoning_plan": "Short chain-of-thought planning which tables, joins, filters, and aggregations to use.",
-  "sql_dialect": "{settings.SQL_DIALECT}",
+  "sql_dialect": "{target_dialect}",
   "sql_query": "SELECT ...;"
 }}
 """
@@ -102,20 +107,28 @@ Please review the error carefully, diagnose what went wrong in your previous SQL
     if "sql_query" not in data or "reasoning_plan" not in data:
         raise ValueError(f"Model output missing required fields: {data}")
 
-    data.setdefault("sql_dialect", settings.SQL_DIALECT)
+    data.setdefault("sql_dialect", target_dialect)
     return data
 
 
-def validate_is_select_query(query: str) -> None:
+def validate_is_select_query(query: str, dialect: Optional[str] = None) -> None:
     """AST validator checking that the query is strictly a read-only SELECT statement."""
-    is_valid, _, error_msg = validate_and_normalize_sql(query, target_dialect=settings.SQL_DIALECT)
+    target_dialect = (dialect or settings.SQL_DIALECT).lower()
+    is_valid, _, error_msg = validate_and_normalize_sql(query, target_dialect=target_dialect)
     if not is_valid:
         raise ValueError(error_msg)
 
 
-async def execute_sql(query: str, max_rows: int = settings.MAX_QUERY_ROWS, timeout_seconds: int = settings.QUERY_TIMEOUT_SECONDS) -> dict:
-    """Step 2: Validates AST with sqlglot and runs query against the read-only DB connection."""
-    is_valid, normalized_sql, validation_error = validate_and_normalize_sql(query, target_dialect=settings.SQL_DIALECT)
+async def execute_sql(
+    query: str,
+    engine: Optional[Any] = None,
+    dialect: Optional[str] = None,
+    max_rows: int = settings.MAX_QUERY_ROWS,
+    timeout_seconds: int = settings.QUERY_TIMEOUT_SECONDS,
+) -> dict:
+    """Step 2: Validates AST with sqlglot and runs query against the target DB connection."""
+    target_dialect = (dialect or settings.SQL_DIALECT).lower()
+    is_valid, normalized_sql, validation_error = validate_and_normalize_sql(query, target_dialect=target_dialect)
     if not is_valid:
         return {
             "success": False,
@@ -126,12 +139,15 @@ async def execute_sql(query: str, max_rows: int = settings.MAX_QUERY_ROWS, timeo
             "dialect_valid": False,
         }
 
+    target_engine = engine or readonly_engine
+
     try:
-        async with readonly_engine.connect() as conn:
-            try:
-                await conn.execute(text(f"SET LOCAL statement_timeout = {timeout_seconds * 1000}"))
-            except Exception:
-                pass
+        async with target_engine.connect() as conn:
+            if "postgres" in target_dialect:
+                try:
+                    await conn.execute(text(f"SET LOCAL statement_timeout = {timeout_seconds * 1000}"))
+                except Exception:
+                    pass
 
             result = await conn.execute(text(normalized_sql))
             columns = list(result.keys()) if result.returns_rows else []
@@ -186,17 +202,27 @@ Synthesized Natural Language Answer:"""
 async def answer_question(
     question: str,
     session_id: Optional[str] = None,
+    connection_id: Optional[str] = None,
+    connection_string: Optional[str] = None,
+    dialect: Optional[str] = None,
     max_retries: int = settings.MAX_RETRIES,
 ) -> dict:
     """Step 3: Orchestrator loop managing memory, planning, AST validation, execution, self-correction, and audit."""
     start_total_time = time.time()
+    target_dialect = (dialect or settings.SQL_DIALECT).lower()
     effective_session_id = memory_store.get_or_create_session_id(session_id)
     history_context = memory_store.format_history_for_prompt(effective_session_id, limit=2)
 
-    # Grounding retrieval (incorporating history context)
+    # Resolve target DB engine
+    if connection_id and connection_string:
+        exec_engine = get_engine_for_connection(connection_id, connection_string)
+    else:
+        exec_engine = readonly_engine
+
+    # Grounding retrieval (incorporating history context and connection namespace)
     retrieval_prompt = f"{history_context} {question}".strip()
-    schema = relevant_schema(retrieval_prompt, top_k=4)
-    golden_examples = retrieve_golden_queries(question, top_k=2)
+    schema = relevant_schema(retrieval_prompt, top_k=4, connection_id=connection_id)
+    golden_examples = retrieve_golden_queries(question, top_k=2, connection_id=connection_id)
 
     sql_attempts = []
     error_context = None
@@ -212,6 +238,8 @@ async def answer_question(
                 few_shot_examples=golden_examples,
                 conversation_history=history_context,
                 error_context=error_context,
+                dialect=target_dialect,
+                connection_id=connection_id,
             )
         except Exception as e:
             error_msg = f"Planning failed on attempt {attempt}: {str(e)}"
@@ -228,7 +256,7 @@ async def answer_question(
                 attempt=attempt,
                 reasoning_plan=None,
                 sql_query=None,
-                sql_dialect=settings.SQL_DIALECT,
+                sql_dialect=target_dialect,
                 dialect_valid=False,
                 ast_valid=False,
                 execution_success=False,
@@ -248,7 +276,11 @@ async def answer_question(
         total_tokens_used += step_tokens
         total_cost += step_cost
 
-        exec_result = await execute_sql(sql_query)
+        exec_result = await execute_sql(
+            sql_query,
+            engine=exec_engine,
+            dialect=target_dialect,
+        )
         latency_ms = (time.time() - attempt_start) * 1000.0
 
         attempt_trace = {
@@ -269,7 +301,7 @@ async def answer_question(
             attempt=attempt,
             reasoning_plan=reasoning_plan,
             sql_query=sql_query,
-            sql_dialect=settings.SQL_DIALECT,
+            sql_dialect=target_dialect,
             dialect_valid=exec_result.get("dialect_valid", False),
             ast_valid=exec_result.get("ast_valid", False),
             execution_success=exec_result["success"],

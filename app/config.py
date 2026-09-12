@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     QUERY_TIMEOUT_SECONDS: int = 5
     AUDIT_LOG_DB_PATH: str = "vector_cache/audit.db"
 
+    # Multi-Tenant Auth & Encryption Settings
+    SECRET_KEY: str = "super-secret-text-to-sql-jwt-key-change-in-production"
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
+    ENCRYPTION_KEY: str = "0G2t7L4D3tM-0fN7V8zL9kP1mQ2wE4rT6yU8iO0pA1s="
+    AUTH_DB_PATH: str = "vector_cache/auth.db"
+
     # Multi-LLM Provider Router Settings
     LLM_PROVIDER: str = "openai"  # Primary default provider
     LLM_PROVIDER_ORDER: Union[List[str], str] = ["anthropic", "openai", "gemini", "groq"]
