@@ -13,42 +13,58 @@ A production-grade, self-correcting **Text-to-SQL system** engineered with multi
 ## 🏛️ System Architecture
 
 ```text
-                                  +-----------------------+
-                                  |     User Question     |
-                                  +-----------+-----------+
-                                              |
-                                              v
-+------------------------------------------------------------------------------------------+
-|  🛡️ 3-Layer Anti-Hallucination Grounding Retrieval                                       |
-|  1. Schema-Linking: Vector similarity extracts exact target tables/columns               |
-|  2. Value Hinting: Distinct low-cardinality values profiled at index time                |
-|  3. Golden Queries: Top-k structurally similar SQL few-shot examples                     |
-+---------------------------------------------+--------------------------------------------+
-                                              |
-                                              v
-+------------------------------------------------------------------------------------------+
-|  🔁 4-Step Agentic Self-Correction Loop                                                 |
-|                                                                                          |
-|    [Step 1: Plan] --------> [Step 2: AST Guardrail] ----> [Step 3: Safe Execution]      |
-|    • Chain-of-Thought       • sqlglot AST verification     • PostgreSQL read-only role   |
-|    • Dialect target         • Prohibits DDL/DML            • Max 500 rows                |
-|                             • Dialect syntax check         • 5-second statement timeout  |
-|                                     |                                   |                |
-|                                     +---- (On Syntax/DB Error) ---------+                |
-|                                     |     Captures error trace & re-enters               |
-|                                     v     plan() for self-correction                     |
-|                                                                                          |
-|    [Step 4: Synthesize Answer] <---------------------------------------+                 |
-|    • Translates raw SQL result rows into clear natural language sentence                 |
-+---------------------------------------------+--------------------------------------------+
-                                              |
-                                              v
-+------------------------------------------------------------------------------------------+
-|  📡 Output & Interfaces                                                                  |
-|  • Streamlit Web UI: Visible reasoning trace, dataframes & auto-charting                 |
-|  • FastAPI REST API: POST /ask, GET /audit, GET /health, DELETE /sessions                |
-|  • Append-Only SQLite Audit Logger: Query traces, token counts, cost & latency           |
-+------------------------------------------------------------------------------------------+
+                                  +---------------------------------------+
+                                  |     Client (REST API / Streamlit)     |
+                                  +-------------------+-------------------+
+                                                      |
+                                                      v
+                                  +---------------------------------------+
+                                  |     🔐 Auth & JWT Gating Layer        |
+                                  |  (POST /auth/register, /auth/login)   |
+                                  +-------------------+-------------------+
+                                                      |
+                                                      v
+                                  +---------------------------------------+
+                                  |   📂 Per-User DatabaseConnection      |
+                                  |  - AES-256 Symmetric Decryption       |
+                                  |  - Dialect Resolution (PG/SQLite/etc) |
+                                  +-------------------+-------------------+
+                                                      |
+                       +------------------------------+------------------------------+
+                       |                                                             |
+                       v                                                             v
+       [📖 READ PATH: POST /ask]                                     [✍️ WRITE PATH: POST /ask/write]
++---------------------------------------------+               +---------------------------------------------+
+| 🛡️ Isolated Grounding (Per-Connection)      |               | 1. Plan Write Query                         |
+| • Schema-Linking (Table/Column vectors)     |               |    • Strictly INSERT / UPDATE / DELETE      |
+| • Distinct Low-Cardinality Value Hints      |               |    • WHERE clause strictly required         |
+| • Few-Shot Golden Query Retrieval           |               |                                             |
+|                                             |               | 2. Write AST Validation (sqlglot)           |
+| 🔁 Agentic Self-Correction Loop             |               |    • Blocks DROP/ALTER/TRUNCATE/multi-stmt  |
+| 1. Plan SQL via Multi-LLM Router            |               |                                             |
+|    (Anthropic -> OpenAI -> Gemini -> Groq)  |               | 3. Dry-Run Preview (Read-Only Connection)   |
+| 2. Read-Only AST Guardrail (sqlglot)        |               |    • UPDATE/DELETE -> Runs SELECT preview   |
+| 3. Safe DB Execution (Read-Only Role)       |               |    • INSERT -> Formats prospective rows     |
+| 4. Self-Correction on Dialect/DB Error      |               |                                             |
+| 5. Synthesize Natural-Language Answer       |               | 4. Mint 5-Minute Signed Preview Token       |
++----------------------+----------------------+               +----------------------+----------------------+
+                       |                                                             |
+                       |                                                             v (User reviews preview)
+                       |                                              +---------------------------------------------+
+                       |                                              | 🚀 POST /ask/write/confirm {preview_token}  |
+                       |                                              | • Cryptographically verifies token & expiry |
+                       |                                              | • Re-validates Write AST                    |
+                       |                                              | • Dedicated Write-Capable Role              |
+                       |                                              | • Explicit ACID Transaction (BEGIN/COMMIT)  |
+                       |                                              | • Automatic Rollback on Any Failure         |
+                       +------------------------------+---------------+---------------------------------------------+
+                                                      |
+                                                      v
+                                  +---------------------------------------+
+                                  |   📝 Append-Only Audit Trail (SQLite) |
+                                  |  • Reads: Plans, Latency, Token Cost  |
+                                  |  • Writes: User, Mutating SQL, Rows   |
+                                  +---------------------------------------+
 ```
 
 ---
@@ -265,6 +281,47 @@ Step 2: Review & Approval -> POST /ask/write/confirm {preview_token}
    - Writes execute inside an explicit database transaction block (`BEGIN ... COMMIT`). If an error occurs, the transaction is immediately rolled back and the database state remains untouched.
 7. **Strict Write Audit Trail**:
    - Every confirmed write is logged to the audit log (`app/audit.py`) with `is_write=1`, user ID, exact SQL statement, execution latency, and affected row count.
+
+---
+
+## 🛡️ Multi-Tenant & Write Support Safety Model
+
+The system is built on a strict defense-in-depth model that guarantees tenant isolation and execution safety across read and write operations:
+
+### 1. Multi-Tenant Isolation & Storage Security
+- **Authentication**: All custom connection management and write endpoints require valid JWT authentication (`Authorization: Bearer <token>`).
+- **Symmetric Encryption at Rest**: All database connection strings are encrypted at rest with AES-256 (`cryptography.fernet`) using `ENCRYPTION_KEY`. Plaintext credentials and passwords are never logged, persisted in plaintext, or returned in API responses.
+- **Namespaced Grounding Vector Caches**: Schema embeddings, low-cardinality value profiles, and golden queries are partitioned in isolated directories (`vector_cache/connections/{connection_id}/`). Query contexts and schemas from User A cannot be retrieved by User B.
+
+### 2. BYODB Read-Only Guarantees & Credentials Caveat
+> [!IMPORTANT]
+> **Safety Caveat on User-Supplied Database Credentials:**
+> Once Bring-Your-Own-Database (BYODB) is enabled, read-only guarantees depend in part on the permissions granted to the database user in the supplied connection string:
+> - **AST-Level Guardrail**: The system parses every SQL AST with `sqlglot` before execution, strictly blocking DDL, DML, and dangerous system functions (`DROP`, `ALTER`, `TRUNCATE`, `pg_sleep`, `dblink`, etc.).
+> - **Write-Probe Advisory**: When a connection is registered, the system performs an active write probe (`CREATE/DROP TEMPORARY TABLE`). If write privileges are detected, the system records `is_read_only = False` and issues a safety recommendation advising the user to provision a dedicated read-only database role.
+> - **Best Practice Recommendation**: For production deployments, users should always configure custom database credentials using a dedicated read-only role (`GRANT SELECT ON ALL TABLES ...`) to ensure hardware-level isolation even in the event of unexpected parser edge cases.
+
+### 3. Opt-In Two-Phase Write Safety Model
+- **Opt-In Flag (`allow_writes: bool`)**: Connections default to `allow_writes = False`. Mutating requests against connections without this flag are rejected with `HTTP 403 Forbidden`.
+- **Mandatory `WHERE` Clause**: Mass updates and mass deletes without a `WHERE` clause are rejected at the AST level with zero overrides.
+- **Dry-Run Preview**: `POST /ask/write` executes an equivalent `SELECT ... WHERE <conditions> LIMIT 100` against the read-only connection, returning preview rows without altering any database records.
+- **Cryptographic Token Binding**: Previews generate a 5-minute signed JWT token bound to the exact SQL statement.
+- **ACID Transaction Commit & Rollback**: `POST /ask/write/confirm` re-validates the AST and executes the write inside a transactional block (`BEGIN ... COMMIT`), automatically issuing a `ROLLBACK` on any database error.
+- **Comprehensive Audit Trail**: Writes are recorded in `audit_logs` with `is_write = 1`, user ID, exact SQL, affected rows, and execution latency.
+
+---
+
+## 🗺️ Roadmap
+
+- [x] **Core Text-to-SQL Agent**: Self-correction loop with sqlglot AST verification and natural language synthesis.
+- [x] **3-Layer Anti-Hallucination Grounding**: Dynamic schema-linking, column value hinting, and few-shot golden queries.
+- [x] **Dialect Enforcement**: Syntax and function validation across PostgreSQL, SQLite, MySQL, and Snowflake.
+- [x] **Conversational Memory**: Multi-turn context tracking and pronoun/reference resolution.
+- [x] **Interactive Streamlit Web UI**: Visible reasoning trace expander, interactive dataframes, and auto-charting.
+- [x] **Automated Benchmark Harness**: Execution Accuracy (EX) evaluation suite and CI gate threshold enforcement.
+- [x] **Multi-LLM Fallback Router**: Priority-ordered failover across Anthropic, OpenAI, Gemini, and Groq.
+- [x] **Multi-Tenant Auth & BYODB**: JWT authentication, AES-256 credential encryption, connection testing, and isolated schema vector indexes.
+- [x] **Safe Opt-In Write Operations**: Two-phase preview and transaction confirmation flow for INSERT/UPDATE/DELETE with mandatory WHERE clauses.
 
 ---
 
