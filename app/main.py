@@ -1,7 +1,11 @@
 from contextlib import asynccontextmanager
 import logging
-from fastapi import FastAPI
+from typing import Any, Dict, List, Optional
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from app.agent import answer_question
 from app.config import settings
 from app.db import check_db_connection, main_engine, readonly_engine
 
@@ -37,6 +41,19 @@ app.add_middleware(
 )
 
 
+class AskRequest(BaseModel):
+    question: str = Field(..., description="Natural language question to ask the database", min_length=1)
+    max_retries: Optional[int] = Field(default=3, ge=1, le=5)
+
+
+class AskResponse(BaseModel):
+    answer: str
+    sql_attempts: List[Dict[str, Any]]
+    final_sql: Optional[str]
+    rows: List[Dict[str, Any]]
+    columns: List[str]
+
+
 @app.get("/")
 async def root():
     return {
@@ -57,3 +74,23 @@ async def health_check():
         "llm_provider": settings.LLM_PROVIDER,
         "llm_model": settings.LLM_MODEL,
     }
+
+
+@app.post("/ask", response_model=AskResponse)
+async def ask(request: AskRequest):
+    """Processes a natural language question through the 4-step plan-generate-execute-retry-synthesize agent loop."""
+    try:
+        result = await answer_question(
+            question=request.question,
+            max_retries=request.max_retries or 3,
+        )
+        return AskResponse(
+            answer=result["answer"],
+            sql_attempts=result["sql_attempts"],
+            final_sql=result["final_sql"],
+            rows=result["rows"],
+            columns=result["columns"],
+        )
+    except Exception as e:
+        logger.error(f"Unhandled error answering question: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

@@ -81,19 +81,79 @@ Access the interactive API documentation at:
 
 ---
 
+## 🧠 Core 4-Step Agentic Pipeline
+
+The system processes questions through a robust 4-step agent pipeline:
+
+1. **`plan(question, schema, error_context)`**:
+   - Calls the LLM to generate a structured JSON plan with step-by-step reasoning (`reasoning_plan`), dialect tag (`sql_dialect`), and SQL query (`sql_query`).
+   - Forces chain-of-thought reasoning over tables, joins, filters, and aggregations before generating SQL.
+2. **`execute_sql(query, max_rows=500, timeout_seconds=5)`**:
+   - Executes the query against the read-only database connection.
+   - Guardrail checks: Enforces strictly `SELECT` statements (disallowing destructive DDL/DML), 500-row limit, and 5-second statement timeout.
+3. **`answer_question(question, max_retries=3)` (Orchestrator Loop)**:
+   - Orchestrates planning and execution.
+   - If execution fails (syntax errors, non-existent columns/tables), it captures the exact database error, feeds it back into `plan()` as context, and self-corrects up to `max_retries`.
+   - Returns a complete execution trace across all attempts.
+4. **`synthesize_answer(question, columns, rows)`**:
+   - Separate, lightweight LLM call that receives query results and translates them into a coherent, user-friendly natural language response.
+
+---
+
+## 📡 API Endpoints
+
+### `POST /ask`
+Submit a natural language question to the database.
+
+**Request:**
+```json
+{
+  "question": "Which customers are located in Germany?",
+  "max_retries": 3
+}
+```
+
+**Response:**
+```json
+{
+  "answer": "The customers located in Germany are Alfreds Futterkiste and Blauer See Delikatessen.",
+  "sql_attempts": [
+    {
+      "attempt": 1,
+      "reasoning_plan": "Filter customers table where country is Germany and select company_name.",
+      "sql_query": "SELECT company_name FROM customers WHERE country = 'Germany';",
+      "success": true,
+      "error": null,
+      "row_count": 2
+    }
+  ],
+  "final_sql": "SELECT company_name FROM customers WHERE country = 'Germany';",
+  "rows": [
+    {"company_name": "Alfreds Futterkiste"},
+    {"company_name": "Blauer See Delikatessen"}
+  ],
+  "columns": ["company_name"]
+}
+```
+
+### `GET /health`
+Returns connection status to the database, target dialect, and LLM configuration.
+
+---
+
 ## 🧪 Running Tests
 
 Run the test suite with pytest:
 ```bash
-pytest
+pytest -v -o asyncio_mode=auto
 ```
 
 ---
 
 ## 🗺️ Roadmap
 - [x] **Phase 0**: Project skeleton, configuration, database pool & read-only setup
-- [ ] **Phase 1**: Dynamic schema extraction & indexing
+- [x] **Phase 1**: Core 4-step plan-generate-execute-retry-synthesize loop & `/ask` endpoint
 - [ ] **Phase 2**: Schema-linking & few-shot context retrieval
-- [ ] **Phase 3**: LLM generation with SQL dialect enforcement & AST parsing
-- [ ] **Phase 4**: Read-only query execution & self-correction error loop
-- [ ] **Phase 5**: Evaluation harness & benchmarking
+- [ ] **Phase 3**: Advanced SQL dialect enforcement & AST parsing
+- [ ] **Phase 4**: Evaluation harness & benchmarking
+
