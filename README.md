@@ -81,22 +81,40 @@ Access the interactive API documentation at:
 
 ---
 
-## 🧠 Core 4-Step Agentic Pipeline
+## 🧠 Core 4-Step Agentic Pipeline & 3-Layer Grounding
 
-The system processes questions through a robust 4-step agent pipeline:
+### 🛡️ Three Layers of Anti-Hallucination Grounding
+To prevent hallucinations across table names, column names, and database values, the agent uses three grounded retrieval layers:
 
-1. **`plan(question, schema, error_context)`**:
-   - Calls the LLM to generate a structured JSON plan with step-by-step reasoning (`reasoning_plan`), dialect tag (`sql_dialect`), and SQL query (`sql_query`).
-   - Forces chain-of-thought reasoning over tables, joins, filters, and aggregations before generating SQL.
+1. **Schema-Linking (Structural Retrieval)**:
+   - Tables, columns, and relations are vectorized. At query time, `relevant_schema(question, top_k=4)` selectively extracts and provides only the relevant schema definitions instead of dumping hundreds of irrelevant columns into prompt context.
+2. **Value Hinting (Column Data Profiling)**:
+   - Low-cardinality columns (e.g. status fields, countries, categories, flags) are profiled at index time. Sample distinct values are appended directly into schema hints (e.g. `discontinued BOOLEAN (sample values: false, true)` or `country VARCHAR (sample values: 'Germany', 'France', ...)`).
+   - This ensures business terms like *"discontinued items"* or *"German customers"* resolve to exact database column values without guessing.
+3. **Golden Queries (Few-Shot Retrieval)**:
+   - Hand-curated SQL queries representing complex multi-join patterns, aggregations, and edge cases are indexed in `data/golden_queries.json`.
+   - `retrieve_golden_queries(question, top_k=2)` finds the most structurally similar examples and injects them as few-shot guides in `plan()`.
+
+### 🔄 Rebuilding Grounding Indexes
+You can rebuild all three layers (column value profiles, schema embeddings, and golden queries) in a single pass with the CLI tool:
+
+```bash
+python -m app.index_schema
+```
+
+---
+
+## 🔁 4-Step Agentic Pipeline
+
+1. **`plan(question, schema, few_shot_examples, error_context)`**:
+   - Calls the LLM with grounded schema context and few-shot golden examples. Generates a structured JSON plan with step-by-step reasoning (`reasoning_plan`), dialect tag (`sql_dialect`), and SQL query (`sql_query`).
 2. **`execute_sql(query, max_rows=500, timeout_seconds=5)`**:
-   - Executes the query against the read-only database connection.
-   - Guardrail checks: Enforces strictly `SELECT` statements (disallowing destructive DDL/DML), 500-row limit, and 5-second statement timeout.
+   - Executes against the read-only PostgreSQL connection.
+   - **Guardrails**: Enforces strictly `SELECT` statements (blocks destructive DDL/DML), 500-row limit, and 5-second statement timeout.
 3. **`answer_question(question, max_retries=3)` (Orchestrator Loop)**:
-   - Orchestrates planning and execution.
-   - If execution fails (syntax errors, non-existent columns/tables), it captures the exact database error, feeds it back into `plan()` as context, and self-corrects up to `max_retries`.
-   - Returns a complete execution trace across all attempts.
+   - Coordinates grounded planning and execution. If execution fails, feeds the exact error back into `plan()` for self-correction up to `max_retries`.
 4. **`synthesize_answer(question, columns, rows)`**:
-   - Separate, lightweight LLM call that receives query results and translates them into a coherent, user-friendly natural language response.
+   - Separate, lightweight LLM call that translates query results into a concise, human-friendly natural language answer.
 
 ---
 
@@ -153,7 +171,7 @@ pytest -v -o asyncio_mode=auto
 ## 🗺️ Roadmap
 - [x] **Phase 0**: Project skeleton, configuration, database pool & read-only setup
 - [x] **Phase 1**: Core 4-step plan-generate-execute-retry-synthesize loop & `/ask` endpoint
-- [ ] **Phase 2**: Schema-linking & few-shot context retrieval
+- [x] **Phase 2**: Three layers of anti-hallucination grounding (Schema-linking + Value hinting + Golden queries)
 - [ ] **Phase 3**: Advanced SQL dialect enforcement & AST parsing
 - [ ] **Phase 4**: Evaluation harness & benchmarking
 

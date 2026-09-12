@@ -6,109 +6,25 @@ from sqlalchemy import text
 from app.config import settings
 from app.db import readonly_engine
 from app.llm import llm_client
+from app.retrieval import relevant_schema, retrieve_golden_queries, DEFAULT_TABLE_SCHEMAS
+
+# Backward compatibility alias
+SAMPLE_SCHEMA = "\n\n".join([d["ddl"] for d in DEFAULT_TABLE_SCHEMAS.values()])
 
 logger = logging.getLogger(__name__)
-
-# Static fallback schema representation based on standard seed database
-SAMPLE_SCHEMA = """
-Table: categories (
-    category_id INTEGER PRIMARY KEY,
-    category_name VARCHAR(100),
-    description TEXT
-)
-
-Table: products (
-    product_id INTEGER PRIMARY KEY,
-    product_name VARCHAR(150),
-    category_id INTEGER REFERENCES categories(category_id),
-    unit_price NUMERIC(10, 2),
-    units_in_stock INTEGER,
-    discontinued BOOLEAN
-)
-
-Table: customers (
-    customer_id VARCHAR(10) PRIMARY KEY,
-    company_name VARCHAR(150),
-    contact_name VARCHAR(100),
-    country VARCHAR(50),
-    city VARCHAR(50)
-)
-
-Table: employees (
-    employee_id INTEGER PRIMARY KEY,
-    first_name VARCHAR(50),
-    last_name VARCHAR(50),
-    title VARCHAR(100),
-    hire_date DATE,
-    department VARCHAR(50)
-)
-
-Table: orders (
-    order_id INTEGER PRIMARY KEY,
-    customer_id VARCHAR(10) REFERENCES customers(customer_id),
-    employee_id INTEGER REFERENCES employees(employee_id),
-    order_date DATE,
-    ship_country VARCHAR(50),
-    freight NUMERIC(10, 2)
-)
-
-Table: order_items (
-    order_id INTEGER REFERENCES orders(order_id),
-    product_id INTEGER REFERENCES products(product_id),
-    unit_price NUMERIC(10, 2),
-    quantity INTEGER,
-    discount NUMERIC(4, 2),
-    PRIMARY KEY (order_id, product_id)
-)
-"""
-
-
-async def get_db_schema() -> str:
-    """Introspects tables and columns from the live DB, falling back to SAMPLE_SCHEMA if offline."""
-    try:
-        query = text("""
-            SELECT 
-                t.table_name, 
-                c.column_name, 
-                c.data_type
-            FROM information_schema.tables t
-            JOIN information_schema.columns c ON t.table_name = c.table_name
-            WHERE t.table_schema = 'public'
-            ORDER BY t.table_name, c.ordinal_position;
-        """)
-        async with readonly_engine.connect() as conn:
-            result = await conn.execute(query)
-            rows = result.fetchall()
-            if not rows:
-                return SAMPLE_SCHEMA
-
-            tables: Dict[str, List[str]] = {}
-            for table_name, column_name, data_type in rows:
-                tables.setdefault(table_name, []).append(f"    {column_name} {data_type}")
-
-            schema_lines = []
-            for t_name, cols in tables.items():
-                schema_lines.append(f"Table: {t_name} (\n" + ",\n".join(cols) + "\n)")
-            return "\n\n".join(schema_lines)
-    except Exception as e:
-        logger.debug(f"Dynamic schema extraction failed, using fallback schema: {e}")
-        return SAMPLE_SCHEMA
 
 
 def clean_json_response(raw_text: str) -> dict:
     """Extracts and parses JSON from model output, stripping any markdown backticks."""
     text_content = raw_text.strip()
     if text_content.startswith("```"):
-        # Strip markdown code block fences
         text_content = re.sub(r"^```(?:json)?\s*", "", text_content, flags=re.MULTILINE)
         text_content = re.sub(r"\s*```$", "", text_content, flags=re.MULTILINE)
     text_content = text_content.strip()
 
-    # Try direct parsing
     try:
         return json.loads(text_content)
     except json.JSONDecodeError:
-        # Fallback: find first { and last }
         start = text_content.find("{")
         end = text_content.rfind("}")
         if start != -1 and end != -1 and end > start:
@@ -118,14 +34,24 @@ def clean_json_response(raw_text: str) -> dict:
 
 async def plan(
     question: str,
-    schema: str,
+    schema: Optional[str] = None,
+    few_shot_examples: Optional[List[dict]] = None,
     error_context: Optional[str] = None,
 ) -> dict:
-    """Step 1: Calls LLM to produce a structured plan and SQL query."""
+    """Step 1: Calls LLM to produce a structured plan and SQL query with schema-linking and few-shot grounding."""
+    # Retrieve relevant schema with value hints if not provided explicitly
+    if not schema:
+        schema = relevant_schema(question, top_k=5)
+
+    # Retrieve golden few-shot examples if not provided
+    if few_shot_examples is None:
+        few_shot_examples = retrieve_golden_queries(question, top_k=2)
+
     system_prompt = f"""You are an expert SQL engineer. Your target dialect is {settings.SQL_DIALECT.upper()}.
-Given a database schema and a natural language question, your job is to:
+Given a relevant database schema (including column types and sample distinct values) and a user question, your task is to:
 1. Reason step-by-step in `reasoning_plan` about which tables, joins, columns, filters, and aggregations are required.
-2. Produce a valid, syntactically correct {settings.SQL_DIALECT.upper()} SELECT query in `sql_query`.
+2. Ground user business terms using the provided column sample values (e.g. if the user asks for 'discontinued products', look for boolean/status column values).
+3. Produce a valid, syntactically correct {settings.SQL_DIALECT.upper()} SELECT query in `sql_query`.
 
 Rules:
 - Generate ONLY SELECT or WITH ... SELECT queries. Never generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, etc.
@@ -138,7 +64,19 @@ Rules:
 Do NOT wrap output in anything other than the JSON object.
 """
 
-    prompt = f"""Database Schema:
+    examples_block = ""
+    if few_shot_examples:
+        examples_text = []
+        for i, ex in enumerate(few_shot_examples, 1):
+            examples_text.append(
+                f"Example {i}:\n"
+                f"Question: {ex['question']}\n"
+                f"Reasoning: {ex.get('reasoning', '')}\n"
+                f"SQL: {ex['sql']}"
+            )
+        examples_block = "Here are examples of how similar questions were solved correctly before:\n" + "\n\n".join(examples_text) + "\n\n"
+
+    prompt = f"""{examples_block}Relevant Database Schema & Sample Values:
 {schema}
 
 User Question:
@@ -155,11 +93,9 @@ Please review the error carefully, diagnose what went wrong in your previous rea
     raw_response = await llm_client.generate(prompt=prompt, system_prompt=system_prompt)
     data = clean_json_response(raw_response)
 
-    # Validate structure
     if "sql_query" not in data or "reasoning_plan" not in data:
         raise ValueError(f"Model output missing required fields: {data}")
 
-    # Ensure sql_dialect is populated
     data.setdefault("sql_dialect", settings.SQL_DIALECT)
     return data
 
@@ -167,11 +103,9 @@ Please review the error carefully, diagnose what went wrong in your previous rea
 def validate_is_select_query(query: str) -> None:
     """Ensures the query is strictly a read-only SELECT statement."""
     cleaned = query.strip()
-    # Remove leading SQL comments
     cleaned = re.sub(r"^--.*$", "", cleaned, flags=re.MULTILINE).strip()
     cleaned = re.sub(r"^/\*.*?\*/", "", cleaned, flags=re.DOTALL).strip()
 
-    # Disallow multiple statements separated by semicolon (to avoid injection)
     statements = [s.strip() for s in cleaned.split(";") if s.strip()]
     if len(statements) > 1:
         raise ValueError("Multiple SQL statements in a single execution are prohibited.")
@@ -184,7 +118,6 @@ def validate_is_select_query(query: str) -> None:
             f"Only read-only SELECT queries are allowed. Forbidden statement type: {first_token}"
         )
 
-    # Disallow destructive keywords in the body
     forbidden_patterns = [
         r"\bINSERT\s+INTO\b",
         r"\bUPDATE\s+",
@@ -216,17 +149,15 @@ async def execute_sql(query: str, max_rows: int = 500, timeout_seconds: int = 5)
 
     try:
         async with readonly_engine.connect() as conn:
-            # Enforce statement timeout in PostgreSQL if supported
             try:
                 await conn.execute(text(f"SET LOCAL statement_timeout = {timeout_seconds * 1000}"))
             except Exception:
-                pass  # If engine/dialect doesn't support statement_timeout
+                pass
 
             result = await conn.execute(text(query))
             columns = list(result.keys()) if result.returns_rows else []
             raw_rows = result.fetchmany(max_rows) if result.returns_rows else []
 
-            # Format rows as list of dicts for JSON serialization
             rows = [dict(zip(columns, row)) for row in raw_rows]
 
             return {
@@ -253,7 +184,6 @@ async def synthesize_answer(question: str, columns: List[str], rows: List[Dict[s
 - Do not output raw JSON or SQL unless requested.
 - If the result set is empty, state clearly that no matching records were found.
 """
-    # Sample up to top 20 rows to avoid blowing context window
     preview_rows = rows[:20]
     total_count = len(rows)
 
@@ -270,8 +200,11 @@ Synthesized Natural Language Answer:"""
 
 
 async def answer_question(question: str, max_retries: int = 3) -> dict:
-    """Step 3: Orchestrator loop managing planning, execution, self-correction, and synthesis."""
-    schema = await get_db_schema()
+    """Step 3: Orchestrator loop managing grounded planning, execution, self-correction, and synthesis."""
+    # Retrieve relevant schema and few-shot golden queries for grounding
+    schema = relevant_schema(question, top_k=4)
+    golden_examples = retrieve_golden_queries(question, top_k=2)
+
     sql_attempts = []
     error_context = None
 
@@ -280,6 +213,7 @@ async def answer_question(question: str, max_retries: int = 3) -> dict:
             plan_result = await plan(
                 question=question,
                 schema=schema,
+                few_shot_examples=golden_examples,
                 error_context=error_context,
             )
         except Exception as e:
@@ -297,7 +231,6 @@ async def answer_question(question: str, max_retries: int = 3) -> dict:
         reasoning_plan = plan_result.get("reasoning_plan")
         sql_query = plan_result.get("sql_query")
 
-        # Execute query
         exec_result = await execute_sql(sql_query)
 
         attempt_trace = {
@@ -311,7 +244,6 @@ async def answer_question(question: str, max_retries: int = 3) -> dict:
         sql_attempts.append(attempt_trace)
 
         if exec_result["success"]:
-            # Query succeeded! Synthesize final answer
             answer_text = await synthesize_answer(
                 question=question,
                 columns=exec_result["columns"],
@@ -326,13 +258,11 @@ async def answer_question(question: str, max_retries: int = 3) -> dict:
                 "columns": exec_result["columns"],
             }
         else:
-            # Prepare error context for next iteration
             error_context = (
                 f"SQL Query attempted:\n{sql_query}\n\n"
                 f"Database Error:\n{exec_result['error']}"
             )
 
-    # If loop exhausted all retries
     last_error = sql_attempts[-1]["error"] if sql_attempts else "Unknown error occurred."
     fallback_answer = (
         f"I was unable to successfully answer your question after {max_retries} attempts. "
