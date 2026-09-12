@@ -89,10 +89,12 @@ async def run_evaluation(
     if max_questions:
         eval_items = eval_items[:max_questions]
 
-    # Auto-detect if API keys are absent and enable mock mode for CI/offline runs
-    has_api_key = bool(settings.OPENAI_API_KEY or settings.ANTHROPIC_API_KEY)
+    # Auto-detect if API keys are absent or placeholder and enable mock mode for CI/offline runs
+    has_openai = bool(settings.OPENAI_API_KEY and settings.OPENAI_API_KEY.strip() and not settings.OPENAI_API_KEY.strip().startswith("your_"))
+    has_anthropic = bool(settings.ANTHROPIC_API_KEY and settings.ANTHROPIC_API_KEY.strip() and not settings.ANTHROPIC_API_KEY.strip().startswith("your_"))
+    has_api_key = has_openai or has_anthropic
     if not has_api_key and not mock_mode:
-        print("\n[Notice] No LLM API key detected in environment. Running evaluation harness in deterministic verification mode (using grounded gold plans to verify DB execution pipeline & AST checks).")
+        print("\n[Notice] No valid LLM API key detected in environment. Running evaluation harness in deterministic verification mode (using grounded gold plans to verify DB execution pipeline & AST checks).")
         mock_mode = True
 
     total_count = len(eval_items)

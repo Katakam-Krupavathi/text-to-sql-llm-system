@@ -30,6 +30,9 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@localhost:5432/text_to_sql_db
       READONLY_DATABASE_URL: postgresql+asyncpg://sql_readonly:readonly_password@localhost:5432/text_to_sql_db
       SQL_DIALECT: postgres
+      SECRET_KEY: ci-test-jwt-secret-key-1234567890
+      ENCRYPTION_KEY: 0G2t7L4D3tM-0fN7V8zL9kP1mQ2wE4rT6yU8iO0pA1s=
+      AUTH_DB_PATH: vector_cache/auth.db
 
     steps:
       - name: Check out repository
