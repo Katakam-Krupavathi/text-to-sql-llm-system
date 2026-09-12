@@ -6,6 +6,7 @@ This provides database-level defense-in-depth against destructive queries.
 import argparse
 import sys
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 
@@ -30,33 +31,53 @@ def setup_readonly_role(
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cur = conn.cursor()
 
+        role_ident = sql.Identifier(readonly_user)
+        db_ident = sql.Identifier(dbname)
+
         # Check if role exists, create if not
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s;", (readonly_user,))
         exists = cur.fetchone()
         if not exists:
             print(f"Creating role '{readonly_user}'...")
-            cur.execute(f"CREATE ROLE {readonly_user} WITH LOGIN PASSWORD %s NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;", (readonly_password,))
+            query = sql.SQL("CREATE ROLE {role} WITH LOGIN PASSWORD %s NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;").format(
+                role=role_ident
+            )
+            cur.execute(query, (readonly_password,))
         else:
             print(f"Role '{readonly_user}' already exists. Updating password and permissions...")
-            cur.execute(f"ALTER ROLE {readonly_user} WITH PASSWORD %s NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;", (readonly_password,))
+            query = sql.SQL("ALTER ROLE {role} WITH PASSWORD %s NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;").format(
+                role=role_ident
+            )
+            cur.execute(query, (readonly_password,))
 
         # Grant read-only permissions
         print(f"Configuring read-only permissions for '{readonly_user}' on database '{dbname}'...")
-        cur.execute(f"GRANT CONNECT ON DATABASE {dbname} TO {readonly_user};")
-        cur.execute(f"GRANT USAGE ON SCHEMA public TO {readonly_user};")
-        cur.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA public TO {readonly_user};")
-        cur.execute(f"GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO {readonly_user};")
+        
+        cur.execute(sql.SQL("GRANT CONNECT ON DATABASE {db} TO {role};").format(
+            db=db_ident, role=role_ident
+        ))
+        cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {role};").format(
+            role=role_ident
+        ))
+        cur.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role};").format(
+            role=role_ident
+        ))
+        cur.execute(sql.SQL("GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO {role};").format(
+            role=role_ident
+        ))
         
         # Default privileges for future tables
-        cur.execute(
-            f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {readonly_user};"
-        )
-        cur.execute(
-            f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO {readonly_user};"
-        )
+        cur.execute(sql.SQL(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {role};"
+        ).format(role=role_ident))
+        cur.execute(sql.SQL(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO {role};"
+        ).format(role=role_ident))
 
         # Explicitly revoke write permissions
-        cur.execute(f"REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM {readonly_user};")
+        cur.execute(sql.SQL(
+            "REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM {role};"
+        ).format(role=role_ident))
 
         cur.close()
         conn.close()
