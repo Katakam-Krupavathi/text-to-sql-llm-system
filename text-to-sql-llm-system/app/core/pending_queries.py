@@ -1,1 +1,0 @@
-pending_query = None
