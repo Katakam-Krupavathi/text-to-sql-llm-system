@@ -10,6 +10,10 @@ import json
 import os
 import sys
 from typing import Any, Dict, List
+
+# Ensure project root is on sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from sqlalchemy import text
 from app.db import readonly_engine
 

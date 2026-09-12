@@ -29,21 +29,21 @@ async def rebuild_all_indexes(verbose: bool = True):
     save_value_hints(hints, output_path=os.path.join(CACHE_DIR, "value_hints.json"))
     retrieval_index.value_hints = hints
     if verbose:
-        print(f"  ✓ Value hints generated for {len(hints)} tables.")
+        print(f"  [OK] Value hints generated for {len(hints)} tables.")
 
     # 2. Extract and vector index table schemas
     if verbose:
         print("\n[2/3] Extracting and indexing table schemas...")
     schema_index = await retrieval_index.build_schema_index_from_db()
     if verbose:
-        print(f"  ✓ Schema index built with {len(schema_index)} tables.")
+        print(f"  [OK] Schema index built with {len(schema_index)} tables.")
 
     # 3. Index golden query few-shot examples
     if verbose:
         print("\n[3/3] Indexing golden query few-shot examples...")
     golden_index = retrieval_index.build_golden_index()
     if verbose:
-        print(f"  ✓ Golden index built with {len(golden_index)} few-shot queries.")
+        print(f"  [OK] Golden index built with {len(golden_index)} few-shot queries.")
 
     if verbose:
         print("\n" + "=" * 60)

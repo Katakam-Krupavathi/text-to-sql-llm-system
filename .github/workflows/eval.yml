@@ -25,6 +25,12 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+    env:
+      PYTHONPATH: .
+      DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@localhost:5432/text_to_sql_db
+      READONLY_DATABASE_URL: postgresql+asyncpg://sql_readonly:readonly_password@localhost:5432/text_to_sql_db
+      SQL_DIALECT: postgres
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -41,8 +47,6 @@ jobs:
           pip install -r requirements.txt
 
       - name: Seed Sample Database
-        env:
-          DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@localhost:5432/text_to_sql_db
         run: |
           python scripts/seed_sample_db.py --dbname text_to_sql_db --user postgres --password postgrespassword --port 5432
 
@@ -51,23 +55,15 @@ jobs:
           python scripts/setup_readonly_role.py --dbname text_to_sql_db --admin-user postgres --admin-password postgrespassword --readonly-user sql_readonly --readonly-password readonly_password --port 5432
 
       - name: Rebuild Grounding Indexes
-        env:
-          DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@localhost:5432/text_to_sql_db
-          READONLY_DATABASE_URL: postgresql+asyncpg://sql_readonly:readonly_password@localhost:5432/text_to_sql_db
         run: |
           python -m app.index_schema
 
       - name: Run Pytest Suite
-        env:
-          DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@localhost:5432/text_to_sql_db
-          READONLY_DATABASE_URL: postgresql+asyncpg://sql_readonly:readonly_password@localhost:5432/text_to_sql_db
         run: |
           pytest -v -o asyncio_mode=auto
 
       - name: Run Execution Accuracy (EX) Benchmark
         env:
-          DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@localhost:5432/text_to_sql_db
-          READONLY_DATABASE_URL: postgresql+asyncpg://sql_readonly:readonly_password@localhost:5432/text_to_sql_db
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           python scripts/run_eval.py --eval-set tests/eval/eval_set.json --threshold 0.70
