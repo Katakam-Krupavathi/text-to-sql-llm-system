@@ -203,8 +203,53 @@ Clears conversation history for a specific session.
 ### `GET /audit`
 Fetch recent audit log records for monitoring and compliance.
 
-### `GET /health`
-Returns connection status to the database, target dialect, rate limits, and LLM configuration.
+## 🖥️ Interactive Web UI (Streamlit)
+
+The system includes a chat interface built with Streamlit in [`app/ui.py`](file:///c:/Users/krupa/OneDrive/Desktop/projects/text-to-sql-llm-system/app/ui.py):
+
+- **Natural Language Chat**: Clean message thread supporting follow-up questions with conversational memory.
+- **Visible Reasoning Trace ("Thought Process")**: Expandable dropdown revealing:
+  - Retrieved schema definitions and sample value hints
+  - Model reasoning plan (chain-of-thought)
+  - Full history of SQL generation attempts, errors, and self-corrections
+  - Verified final executable SQL with syntax highlighting
+- **Interactive Dataframes**: Renders full query result sets in tabular format.
+- **Automatic Visualizations**: Auto-detects categorical + numeric dimensions and renders bar/line charts.
+- **Performance Badges**: Displays execution attempt count, latency, tokens used, and estimated cost.
+
+```text
++-----------------------------------------------------------------------+
+|  🤖 Enterprise Text-to-SQL Agent                                      |
+|                                                                       |
+|  User: What is the total revenue by product category?                 |
+|                                                                       |
+|  Assistant: Total revenue by category is led by Dairy Products        |
+|             ($54,200) followed by Beverages ($48,150)...              |
+|                                                                       |
+|  🎯 Resolved on 1st attempt | ⏱️ 420 ms | 🪙 230 tokens ($0.00085)     |
+|                                                                       |
+|  ▼ 🔍 Thought Process & Agent Reasoning Trace                         |
+|     • Reasoning: Join categories, products, order_items...            |
+|     • SQL: SELECT c.category_name, SUM(...) FROM categories c...      |
+|     • Status: ✓ Validated & Executed (8 rows returned)                |
+|                                                                       |
+|  [ Dataframe: category_name | category_revenue ]                      |
+|  [ Bar Chart: category_revenue by category_name ]                     |
++-----------------------------------------------------------------------+
+```
+
+### Launching the Web UI
+
+1. Make sure the FastAPI backend is running:
+```bash
+uvicorn app.main:app --reload --port 8000
+```
+
+2. In a separate terminal, launch the Streamlit frontend:
+```bash
+streamlit run app/ui.py
+```
+Open [http://localhost:8501](http://localhost:8501) in your browser.
 
 ---
 
@@ -223,5 +268,6 @@ pytest -v -o asyncio_mode=auto
 - [x] **Phase 2**: Three layers of anti-hallucination grounding (Schema-linking + Value hinting + Golden queries)
 - [x] **Phase 3**: Safety guardrails & dialect enforcement (read-only role, AST parser, rate limiter, audit log)
 - [x] **Phase 4**: Multi-turn conversation memory & follow-up reference resolution
-- [ ] **Phase 5**: Evaluation harness & benchmarking
+- [x] **Phase 5**: Interactive Streamlit UI with visible reasoning trace, auto-charting, and dataframes
+- [ ] **Phase 6**: Evaluation harness & benchmarking
 
