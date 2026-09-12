@@ -34,11 +34,16 @@ def init_auth_db():
                     dialect TEXT NOT NULL,
                     encrypted_connection_string TEXT NOT NULL,
                     is_read_only BOOLEAN NOT NULL DEFAULT 1,
+                    allow_writes BOOLEAN NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     last_validated_at TEXT NOT NULL,
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                 );
             """)
+            try:
+                conn.execute("ALTER TABLE database_connections ADD COLUMN allow_writes BOOLEAN NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
     finally:
         conn.close()
 
@@ -98,6 +103,7 @@ def create_database_connection(
     dialect: str,
     encrypted_connection_string: str,
     is_read_only: bool = True,
+    allow_writes: bool = False,
 ) -> dict:
     conn_id = str(uuid.uuid4())
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -107,8 +113,8 @@ def create_database_connection(
             conn.execute(
                 """
                 INSERT INTO database_connections 
-                (id, user_id, nickname, dialect, encrypted_connection_string, is_read_only, created_at, last_validated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, user_id, nickname, dialect, encrypted_connection_string, is_read_only, allow_writes, created_at, last_validated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conn_id,
@@ -117,6 +123,7 @@ def create_database_connection(
                     dialect.strip().lower(),
                     encrypted_connection_string,
                     1 if is_read_only else 0,
+                    1 if allow_writes else 0,
                     now_iso,
                     now_iso,
                 ),
@@ -127,6 +134,7 @@ def create_database_connection(
             "nickname": nickname.strip(),
             "dialect": dialect.strip().lower(),
             "is_read_only": is_read_only,
+            "allow_writes": allow_writes,
             "created_at": now_iso,
             "last_validated_at": now_iso,
         }
@@ -140,7 +148,7 @@ def get_connections_for_user(user_id: str) -> List[dict]:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, user_id, nickname, dialect, is_read_only, created_at, last_validated_at
+            SELECT id, user_id, nickname, dialect, is_read_only, allow_writes, created_at, last_validated_at
             FROM database_connections 
             WHERE user_id = ?
             ORDER BY created_at DESC
@@ -155,6 +163,7 @@ def get_connections_for_user(user_id: str) -> List[dict]:
                 "nickname": r["nickname"],
                 "dialect": r["dialect"],
                 "is_read_only": bool(r["is_read_only"]),
+                "allow_writes": bool(r["allow_writes"]) if "allow_writes" in r.keys() else False,
                 "created_at": r["created_at"],
                 "last_validated_at": r["last_validated_at"],
             }
@@ -173,6 +182,7 @@ def get_connection_by_id(connection_id: str) -> Optional[dict]:
         if row:
             d = dict(row)
             d["is_read_only"] = bool(d["is_read_only"])
+            d["allow_writes"] = bool(d.get("allow_writes", False))
             return d
         return None
     finally:

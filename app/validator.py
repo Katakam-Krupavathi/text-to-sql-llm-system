@@ -1,6 +1,6 @@
 import logging
 import re
-from typing import Tuple
+from typing import Optional, Tuple
 import sqlglot
 from sqlglot import exp
 from sqlglot.errors import SqlglotError
@@ -136,3 +136,111 @@ def validate_and_normalize_sql(
         normalized_sql = cleaned_query
 
     return True, normalized_sql, ""
+
+
+FORBIDDEN_WRITE_TYPES = (
+    exp.Drop,
+    exp.Alter,
+    exp.Create,
+    exp.Command,
+    exp.Transaction,
+    exp.Commit,
+    exp.Rollback,
+    exp.Grant,
+    exp.Revoke,
+    exp.Pragma,
+    exp.Kill,
+)
+
+
+def validate_write_sql(
+    query: str,
+    target_dialect: str = settings.SQL_DIALECT,
+) -> Tuple[bool, str, str]:
+    """
+    Parses and validates a mutating SQL query (INSERT, UPDATE, DELETE).
+    Strictly enforces:
+    - Exactly one statement.
+    - Only INSERT, UPDATE, or DELETE statements (rejects SELECT, DROP, ALTER, TRUNCATE, GRANT, etc.).
+    - Mandatory WHERE clause on UPDATE and DELETE statements.
+    - No forbidden system functions (e.g. pg_sleep, dblink).
+    Returns: (is_valid, normalized_sql_or_empty, error_message_or_empty)
+    """
+    if not query or not query.strip():
+        return False, "", "Empty query provided."
+
+    cleaned_query = query.strip()
+    cleaned_query = re.sub(r"^--.*$", "", cleaned_query, flags=re.MULTILINE).strip()
+    cleaned_query = re.sub(r"^/\*.*?\*/", "", cleaned_query, flags=re.DOTALL).strip()
+
+    glot_dialect = "postgres" if target_dialect.lower() in ("postgres", "postgresql") else target_dialect.lower()
+
+    # 1. Dialect & syntax parsing
+    try:
+        parsed_statements = sqlglot.parse(cleaned_query, read=glot_dialect)
+    except SqlglotError as e:
+        return False, "", f"Dialect syntax error ({target_dialect}): {str(e)}"
+    except Exception as e:
+        return False, "", f"SQL parse failure: {str(e)}"
+
+    if not parsed_statements:
+        return False, "", "No executable SQL statements found in query."
+
+    if len(parsed_statements) > 1:
+        return False, "", "Multiple SQL statements in a single request are strictly prohibited."
+
+    root_ast = parsed_statements[0]
+    if root_ast is None:
+        return False, "", "Failed to parse SQL AST."
+
+    # 2. Check for prohibited AST expression types anywhere in tree
+    for node in root_ast.walk():
+        if isinstance(node, FORBIDDEN_WRITE_TYPES) or "truncate" in type(node).__name__.lower():
+            node_type = type(node).__name__
+            return False, "", f"Security Violation: Query contains prohibited operation '{node_type}'."
+
+        # Check for forbidden function calls
+        if isinstance(node, exp.Anonymous):
+            func_name = node.name.lower()
+            if func_name in FORBIDDEN_FUNCTIONS:
+                return False, "", f"Security Violation: Query contains forbidden function '{func_name}'."
+        elif isinstance(node, exp.Func):
+            func_name = node.sql_name().lower() if hasattr(node, "sql_name") else node.key.lower()
+            if func_name in FORBIDDEN_FUNCTIONS:
+                return False, "", f"Security Violation: Query contains forbidden function '{func_name}'."
+
+    # 3. Verify root AST is strictly INSERT, UPDATE, or DELETE
+    if not isinstance(root_ast, (exp.Insert, exp.Update, exp.Delete)):
+        return (
+            False,
+            "",
+            f"Security Violation: Only INSERT, UPDATE, and DELETE operations are permitted in write path (got {type(root_ast).__name__}).",
+        )
+
+    # 4. Strictly require a WHERE clause on UPDATE and DELETE statements
+    if isinstance(root_ast, (exp.Update, exp.Delete)):
+        where_node = root_ast.args.get("where") or root_ast.find(exp.Where)
+        if not where_node or not where_node.this:
+            op_name = "UPDATE" if isinstance(root_ast, exp.Update) else "DELETE"
+            return (
+                False,
+                "",
+                f"Security Violation: {op_name} statement strictly requires a WHERE clause to prevent unconditional mass modification.",
+            )
+
+    # Generate normalized SQL compliant with dialect
+    try:
+        normalized_sql = root_ast.sql(dialect=glot_dialect)
+    except Exception:
+        normalized_sql = cleaned_query
+
+    return True, normalized_sql, ""
+
+
+def validate_is_write_query(query: str, dialect: Optional[str] = None) -> None:
+    """AST validator checking that the query is strictly a valid INSERT/UPDATE/DELETE statement with WHERE clause."""
+    target_dialect = (dialect or settings.SQL_DIALECT).lower()
+    is_valid, _, error_msg = validate_write_sql(query, target_dialect=target_dialect)
+    if not is_valid:
+        raise ValueError(error_msg)
+

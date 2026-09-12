@@ -57,11 +57,26 @@ class AuditLogger:
                         error_message TEXT,
                         latency_ms REAL,
                         tokens_used INTEGER,
-                        cost_usd REAL
+                        cost_usd REAL,
+                        is_write BOOLEAN DEFAULT 0,
+                        user_id TEXT,
+                        affected_rows INTEGER DEFAULT 0
                     );
                 """)
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_success ON audit_logs(execution_success);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_is_write ON audit_logs(is_write);")
+                
+                # Migrations for existing DB files
+                for col_def in [
+                    ("is_write", "BOOLEAN DEFAULT 0"),
+                    ("user_id", "TEXT"),
+                    ("affected_rows", "INTEGER DEFAULT 0"),
+                ]:
+                    try:
+                        cursor.execute(f"ALTER TABLE audit_logs ADD COLUMN {col_def[0]} {col_def[1]}")
+                    except sqlite3.OperationalError:
+                        pass
                 conn.commit()
         except Exception as e:
             logger.warning(f"Could not initialize SQLite audit database at {self.db_path}: {e}")
@@ -80,6 +95,9 @@ class AuditLogger:
         latency_ms: float = 0.0,
         tokens_used: int = 0,
         cost_usd: float = 0.0,
+        is_write: bool = False,
+        user_id: Optional[str] = None,
+        affected_rows: int = 0,
     ) -> None:
         """Appends a structured log entry into the SQLite audit table."""
         timestamp_str = datetime.now(timezone.utc).isoformat()
@@ -91,8 +109,9 @@ class AuditLogger:
                     INSERT INTO audit_logs (
                         timestamp, question, attempt, reasoning_plan, sql_query,
                         sql_dialect, dialect_valid, ast_valid, execution_success,
-                        error_message, latency_ms, tokens_used, cost_usd
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        error_message, latency_ms, tokens_used, cost_usd,
+                        is_write, user_id, affected_rows
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         timestamp_str,
@@ -108,11 +127,61 @@ class AuditLogger:
                         latency_ms,
                         tokens_used,
                         cost_usd,
+                        1 if is_write else 0,
+                        user_id,
+                        affected_rows,
                     ),
                 )
                 conn.commit()
         except Exception as e:
             logger.error(f"Failed to record audit log: {e}")
+
+    def log_write_execution(
+        self,
+        user_id: str,
+        sql_query: str,
+        sql_dialect: str,
+        affected_rows: int,
+        execution_success: bool,
+        error_message: Optional[str] = None,
+        latency_ms: float = 0.0,
+    ) -> None:
+        """Appends an explicit write-operation confirmation log entry."""
+        timestamp_str = datetime.now(timezone.utc).isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO audit_logs (
+                        timestamp, question, attempt, reasoning_plan, sql_query,
+                        sql_dialect, dialect_valid, ast_valid, execution_success,
+                        error_message, latency_ms, tokens_used, cost_usd,
+                        is_write, user_id, affected_rows
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        timestamp_str,
+                        f"[WRITE CONFIRMED] User {user_id} executed mutating SQL",
+                        1,
+                        "Explicit write transaction confirmed and committed",
+                        sql_query,
+                        sql_dialect,
+                        True,
+                        True,
+                        execution_success,
+                        error_message,
+                        latency_ms,
+                        0,
+                        0.0,
+                        1,
+                        user_id,
+                        affected_rows,
+                    ),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to record write audit log: {e}")
 
     def get_recent_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Retrieves recent audit logs."""

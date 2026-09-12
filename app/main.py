@@ -1,11 +1,15 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 import logging
+import time
 from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from jose import JWTError, jwt
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 
-from app.agent import answer_question
+from app.agent import answer_question, generate_write_preview, plan_write
 from app.audit import audit_logger
 from app.auth import create_access_token, get_current_user, hash_password, verify_password, security_bearer, decode_access_token
 from app.config import settings
@@ -28,6 +32,7 @@ from app.models import (
 )
 from app.rate_limiter import rate_limit_dependency
 from app.retrieval import delete_connection_retrieval_index, get_retrieval_index
+from app.validator import validate_write_sql
 from fastapi.security import HTTPAuthorizationCredentials
 
 logging.basicConfig(
@@ -48,8 +53,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.APP_NAME,
-    version="0.4.0",
-    description="Production-ready Text-to-SQL Agent with Multi-Tenant Auth, BYODB Support, Conversation Memory, AST Validation, Dialect Enforcement, and Guardrails",
+    version="0.5.0",
+    description="Production-ready Text-to-SQL Agent with Multi-Tenant Auth, BYODB Support, Opt-In Safe Write Flow, Conversation Memory, AST Validation, Dialect Enforcement, and Guardrails",
     lifespan=lifespan,
 )
 
@@ -91,6 +96,7 @@ class CreateConnectionRequest(BaseModel):
     nickname: str = Field(..., min_length=1, max_length=100, description="Friendly nickname for the DB")
     dialect: str = Field(default="postgres", description="Database dialect (e.g. postgres, sqlite, mysql)")
     connection_string: str = Field(..., min_length=1, description="Database connection URI")
+    allow_writes: bool = Field(default=False, description="Opt-in flag enabling INSERT/UPDATE/DELETE write operations on this connection")
 
 
 class ConnectionResponse(BaseModel):
@@ -99,6 +105,7 @@ class ConnectionResponse(BaseModel):
     nickname: str
     dialect: str
     is_read_only: bool
+    allow_writes: bool = False
     created_at: str
     last_validated_at: str
     warning: Optional[str] = None
@@ -121,6 +128,33 @@ class AskResponse(BaseModel):
     total_tokens_used: Optional[int] = 0
     estimated_cost_usd: Optional[float] = 0.0
     total_latency_ms: Optional[float] = 0.0
+
+
+class AskWriteRequest(BaseModel):
+    question: str = Field(..., description="Natural language request requesting a data modification (INSERT/UPDATE/DELETE)", min_length=1)
+    connection_id: Optional[str] = Field(default=None, description="Optional target database connection ID")
+    session_id: Optional[str] = Field(default=None, description="Optional conversation session ID")
+
+
+class AskWriteResponse(BaseModel):
+    preview_token: str = Field(..., description="Short-lived (5m) cryptographically signed token bound to the exact SQL previewed")
+    operation: str = Field(..., description="Mutating operation type (INSERT, UPDATE, DELETE)")
+    sql_query: str = Field(..., description="Generated and validated SQL query")
+    reasoning_plan: str = Field(..., description="Agent chain-of-thought explanation")
+    preview_rows: List[Dict[str, Any]] = Field(default_factory=list, description="Affected rows preview for UPDATE/DELETE or formatted records for INSERT")
+    affected_count_estimate: int = Field(default=0, description="Estimated number of affected rows")
+    expires_in_seconds: int = Field(default=300, description="Token expiration window in seconds")
+
+
+class ConfirmWriteRequest(BaseModel):
+    preview_token: str = Field(..., description="Preview token received from POST /ask/write")
+
+
+class ConfirmWriteResponse(BaseModel):
+    status: str = "committed"
+    sql: str
+    affected_rows: int
+    timestamp: str
 
 
 async def get_optional_current_user(
@@ -238,6 +272,7 @@ async def create_connection(
         dialect=req.dialect,
         encrypted_connection_string=encrypted_str,
         is_read_only=is_read_only,
+        allow_writes=req.allow_writes,
     )
 
     # 4. Automatically index schema for this connection
@@ -254,6 +289,7 @@ async def create_connection(
         nickname=record["nickname"],
         dialect=record["dialect"],
         is_read_only=record["is_read_only"],
+        allow_writes=record.get("allow_writes", False),
         created_at=record["created_at"],
         last_validated_at=record["last_validated_at"],
         warning=warning_msg,
@@ -338,6 +374,184 @@ async def ask(
     except Exception as e:
         logger.error(f"Unhandled error answering question: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ask/write", response_model=AskWriteResponse, dependencies=[Depends(rate_limit_dependency)])
+async def ask_write(
+    request: AskWriteRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Generates a mutating SQL query (INSERT/UPDATE/DELETE) via plan_write(), runs a dry-run preview,
+    and returns affected rows along with a short-lived preview token.
+    Never executes the mutating statement directly.
+    """
+    target_conn_str = None
+    target_dialect = settings.SQL_DIALECT
+    target_conn_id = None
+    target_engine = readonly_engine
+
+    if request.connection_id:
+        conn_record = get_connection_by_id(request.connection_id)
+        if not conn_record or conn_record["user_id"] != current_user["id"]:
+            raise HTTPException(status_code=404, detail="Connection not found or access denied.")
+        if not conn_record.get("allow_writes", False):
+            raise HTTPException(
+                status_code=403,
+                detail="Write operations are disabled for this database connection. Set 'allow_writes: true' on the connection to enable writes.",
+            )
+        target_conn_str = decrypt_connection_string(conn_record["encrypted_connection_string"])
+        target_dialect = conn_record["dialect"]
+        target_conn_id = conn_record["id"]
+        target_engine = get_engine_for_connection(target_conn_id, target_conn_str)
+    else:
+        user_conns = get_connections_for_user(current_user["id"])
+        if user_conns:
+            first_conn = get_connection_by_id(user_conns[0]["id"])
+            if first_conn:
+                if not first_conn.get("allow_writes", False):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Write operations are disabled for this database connection. Set 'allow_writes: true' on the connection to enable writes.",
+                    )
+                target_conn_str = decrypt_connection_string(first_conn["encrypted_connection_string"])
+                target_dialect = first_conn["dialect"]
+                target_conn_id = first_conn["id"]
+                target_engine = get_engine_for_connection(target_conn_id, target_conn_str)
+        else:
+            target_conn_str = settings.effective_readonly_db_url
+            target_dialect = settings.SQL_DIALECT
+            target_engine = readonly_engine
+
+    # 1. Generate plan for write operation
+    try:
+        plan_result = await plan_write(
+            question=request.question,
+            dialect=target_dialect,
+            connection_id=target_conn_id,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to plan write SQL: {str(e)}")
+
+    sql_query = plan_result.get("sql_query")
+    reasoning_plan = plan_result.get("reasoning_plan", "")
+
+    # 2. Validate write SQL strictly (enforces WHERE clause on UPDATE/DELETE)
+    is_valid, normalized_sql, validation_err = validate_write_sql(sql_query, target_dialect=target_dialect)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=f"Write SQL validation failed: {validation_err}")
+
+    # 3. Generate dry-run preview (runs SELECT or extracts insert row)
+    try:
+        operation, preview_rows, affected_count = await generate_write_preview(
+            normalized_sql,
+            engine=target_engine,
+            dialect=target_dialect,
+            max_preview_rows=100,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Preview generation failed: {str(e)}")
+
+    # 4. Generate 5-minute cryptographically signed preview token
+    token_payload = {
+        "sub": current_user["id"],
+        "connection_id": target_conn_id,
+        "sql": normalized_sql,
+        "operation": operation,
+        "type": "write_preview",
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+    }
+    preview_token = jwt.encode(token_payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+    return AskWriteResponse(
+        preview_token=preview_token,
+        operation=operation,
+        sql_query=normalized_sql,
+        reasoning_plan=reasoning_plan,
+        preview_rows=preview_rows,
+        affected_count_estimate=affected_count,
+        expires_in_seconds=300,
+    )
+
+
+@app.post("/ask/write/confirm", response_model=ConfirmWriteResponse)
+async def confirm_write(
+    request: ConfirmWriteRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Explicitly executes and commits a previously previewed write query inside a database transaction.
+    Re-validates preview token, connection write permission, and SQL safety before executing.
+    """
+    # 1. Validate preview token
+    try:
+        payload = jwt.decode(request.preview_token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        if payload.get("type") != "write_preview":
+            raise HTTPException(status_code=400, detail="Invalid token type.")
+        if payload.get("sub") != current_user["id"]:
+            raise HTTPException(status_code=403, detail="Token does not belong to the authenticated user.")
+    except JWTError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid or expired preview token: {e}")
+
+    sql_to_execute = payload.get("sql")
+    target_conn_id = payload.get("connection_id")
+
+    # 2. Resolve write-capable database connection
+    if target_conn_id:
+        conn_record = get_connection_by_id(target_conn_id)
+        if not conn_record or conn_record["user_id"] != current_user["id"]:
+            raise HTTPException(status_code=404, detail="Target connection not found or access denied.")
+        if not conn_record.get("allow_writes", False):
+            raise HTTPException(status_code=403, detail="Write operations are disabled for this database connection.")
+        target_conn_str = decrypt_connection_string(conn_record["encrypted_connection_string"])
+        target_dialect = conn_record["dialect"]
+        write_engine = get_engine_for_connection(target_conn_id, target_conn_str)
+    else:
+        target_dialect = settings.SQL_DIALECT
+        write_engine = main_engine
+
+    # 3. Re-validate write SQL before execution (never trust token blindly)
+    is_valid, normalized_sql, validation_err = validate_write_sql(sql_to_execute, target_dialect=target_dialect)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=f"Security re-validation failed: {validation_err}")
+
+    # 4. Execute inside a transactional block (commits on clean exit, rolls back on exception)
+    start_t = time.time()
+    try:
+        async with write_engine.begin() as conn:
+            result = await conn.execute(text(normalized_sql))
+            affected_rows = result.rowcount if hasattr(result, "rowcount") and result.rowcount is not None and result.rowcount >= 0 else 1
+
+        latency_ms = (time.time() - start_t) * 1000.0
+        audit_logger.log_write_execution(
+            user_id=current_user["id"],
+            sql_query=normalized_sql,
+            sql_dialect=target_dialect,
+            affected_rows=affected_rows,
+            execution_success=True,
+            latency_ms=latency_ms,
+        )
+
+        return ConfirmWriteResponse(
+            status="committed",
+            sql=normalized_sql,
+            affected_rows=affected_rows,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+    except Exception as e:
+        latency_ms = (time.time() - start_t) * 1000.0
+        err_msg = str(e)
+        logger.error(f"Write transaction failed for query '{normalized_sql}': {err_msg}")
+        audit_logger.log_write_execution(
+            user_id=current_user["id"],
+            sql_query=normalized_sql,
+            sql_dialect=target_dialect,
+            affected_rows=0,
+            execution_success=False,
+            error_message=err_msg,
+            latency_ms=latency_ms,
+        )
+        raise HTTPException(status_code=500, detail=f"Transaction rolled back due to execution error: {err_msg}")
 
 
 @app.get("/audit")

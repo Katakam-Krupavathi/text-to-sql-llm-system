@@ -2,15 +2,17 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import text
+import sqlglot
+from sqlglot import exp
 from app.audit import audit_logger, calculate_cost, estimate_tokens
 from app.config import settings
 from app.db import readonly_engine
 from app.llm import llm_client, llm_router
 from app.memory import memory_store
 from app.retrieval import relevant_schema, retrieve_golden_queries, DEFAULT_TABLE_SCHEMAS
-from app.validator import validate_and_normalize_sql
+from app.validator import validate_and_normalize_sql, validate_write_sql
 
 from app.connections import get_engine_for_connection
 
@@ -109,6 +111,157 @@ Please review the error carefully, diagnose what went wrong in your previous SQL
 
     data.setdefault("sql_dialect", target_dialect)
     return data
+
+
+def classify_intent(question: str) -> str:
+    """
+    Lightweight heuristic to detect whether a question intends
+    a mutating write operation (INSERT/UPDATE/DELETE) or a read query (SELECT).
+    """
+    q_lower = question.lower().strip()
+    write_patterns = [
+        r"\binsert\b",
+        r"\badd\s+(?:a\s+|new\s+)?(?:row|record|customer|order|item|user|product)",
+        r"\bcreate\s+(?:a\s+|new\s+)?(?:record|row|entry|customer|order|item)",
+        r"\bupdate\b",
+        r"\bset\b.*\bwhere\b",
+        r"\bmodify\b",
+        r"\bchange\s+the\b",
+        r"\bdelete\b",
+        r"\bremove\b",
+    ]
+    for pattern in write_patterns:
+        if re.search(pattern, q_lower):
+            return "write"
+    return "read"
+
+
+async def plan_write(
+    question: str,
+    schema: Optional[str] = None,
+    few_shot_examples: Optional[List[dict]] = None,
+    conversation_history: Optional[str] = None,
+    error_context: Optional[str] = None,
+    dialect: Optional[str] = None,
+    connection_id: Optional[str] = None,
+) -> dict:
+    """Step 1 (Write Path): Calls LLM with schema and strict write constraints (INSERT/UPDATE/DELETE with WHERE)."""
+    target_dialect = (dialect or settings.SQL_DIALECT).lower()
+    if not schema:
+        retrieval_query = f"{conversation_history or ''} {question}".strip()
+        schema = relevant_schema(retrieval_query, top_k=5, connection_id=connection_id)
+
+    system_prompt = f"""You are an expert SQL database engineer. Your target database dialect is strictly {target_dialect.upper()}.
+CRITICAL SAFETY & WRITE INSTRUCTIONS:
+- You MUST produce syntactically valid {target_dialect.upper()} data modification SQL queries.
+- Generate ONLY INSERT, UPDATE, or DELETE statements.
+- For UPDATE and DELETE queries, you MUST include a specific WHERE clause. Unconditional mass updates or deletes (without WHERE) are strictly prohibited.
+- NEVER generate DROP, ALTER, TRUNCATE, CREATE TABLE, GRANT, REVOKE, or multi-statement queries.
+- Return ONLY a valid JSON object with the exact keys: "reasoning_plan", "sql_dialect", and "sql_query".
+
+Output Format JSON:
+{{
+  "reasoning_plan": "Short chain-of-thought explaining the target table, affected fields, and WHERE conditions.",
+  "sql_dialect": "{target_dialect}",
+  "sql_query": "UPDATE ... SET ... WHERE ...;"
+}}
+"""
+
+    history_block = conversation_history or ""
+    prompt = f"""{history_block}Relevant Database Schema & Sample Values:
+{schema}
+
+User Request (Data Modification):
+{question}
+"""
+    if error_context:
+        prompt += f"""
+Previous Attempt Failed:
+{error_context}
+
+Please review the error carefully and produce a corrected mutating SQL query.
+"""
+
+    raw_response = await llm_client.generate(prompt=prompt, system_prompt=system_prompt)
+    data = clean_json_response(raw_response)
+
+    if "sql_query" not in data or "reasoning_plan" not in data:
+        raise ValueError(f"Model output missing required fields: {data}")
+
+    data.setdefault("sql_dialect", target_dialect)
+    return data
+
+
+async def generate_write_preview(
+    sql_query: str,
+    engine: Any,
+    dialect: Optional[str] = None,
+    max_preview_rows: int = 100,
+) -> Tuple[str, List[Dict[str, Any]], int]:
+    """
+    Generates a dry-run preview for an INSERT/UPDATE/DELETE statement without mutating data.
+    - For UPDATE/DELETE: runs a read-only SELECT * FROM table WHERE ... LIMIT 100 on the engine.
+    - For INSERT: extracts parsed rows/values to be inserted.
+    Returns: (operation_name, preview_rows, affected_count_estimate)
+    """
+    target_dialect = (dialect or settings.SQL_DIALECT).lower()
+    is_valid, normalized_sql, err = validate_write_sql(sql_query, target_dialect=target_dialect)
+    if not is_valid:
+        raise ValueError(err)
+
+    glot_dialect = "postgres" if target_dialect in ("postgres", "postgresql") else target_dialect
+    parsed = sqlglot.parse_one(normalized_sql, read=glot_dialect)
+
+    if isinstance(parsed, exp.Insert):
+        operation = "INSERT"
+        table_name = parsed.this.this.sql(dialect=glot_dialect) if hasattr(parsed.this, "this") else parsed.this.sql(dialect=glot_dialect)
+        
+        col_names = []
+        if isinstance(parsed.this, exp.Schema) and parsed.this.expressions:
+            col_names = [col.sql(dialect=glot_dialect).strip('"') for col in parsed.this.expressions]
+
+        preview_rows = []
+        values_expr = parsed.find(exp.Values)
+        if values_expr and values_expr.expressions:
+            for tuple_expr in values_expr.expressions:
+                if isinstance(tuple_expr, exp.Tuple):
+                    row_vals = [val.sql(dialect=glot_dialect).strip("'") for val in tuple_expr.expressions]
+                else:
+                    row_vals = [tuple_expr.sql(dialect=glot_dialect).strip("'")]
+                
+                if col_names and len(col_names) == len(row_vals):
+                    row_dict = dict(zip(col_names, row_vals))
+                else:
+                    row_dict = {col_names[i] if i < len(col_names) else f"col_{i+1}": v for i, v in enumerate(row_vals)}
+                row_dict["_table"] = table_name
+                preview_rows.append(row_dict)
+        elif not preview_rows:
+            preview_rows = [{"_operation": "INSERT", "_table": table_name, "_query": normalized_sql}]
+
+        return operation, preview_rows, len(preview_rows)
+
+    elif isinstance(parsed, (exp.Update, exp.Delete)):
+        operation = "UPDATE" if isinstance(parsed, exp.Update) else "DELETE"
+        table_name = parsed.this.sql(dialect=glot_dialect)
+        where_node = parsed.args.get("where") or parsed.find(exp.Where)
+        if not where_node or not where_node.this:
+            raise ValueError(f"Cannot preview {operation} without a WHERE clause.")
+
+        where_sql = where_node.sql(dialect=glot_dialect)
+        preview_select = f"SELECT * FROM {table_name} {where_sql} LIMIT {max_preview_rows}"
+        
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(text(preview_select))
+                cols = list(result.keys()) if result.returns_rows else []
+                raw_rows = result.fetchmany(max_preview_rows) if result.returns_rows else []
+                preview_rows = [dict(zip(cols, row)) for row in raw_rows]
+                return operation, preview_rows, len(preview_rows)
+        except Exception as e:
+            logger.warning(f"Dry-run preview SELECT failed: {e}")
+            return operation, [], 0
+    else:
+        raise ValueError(f"Unsupported write operation: {type(parsed).__name__}")
 
 
 def validate_is_select_query(query: str, dialect: Optional[str] = None) -> None:

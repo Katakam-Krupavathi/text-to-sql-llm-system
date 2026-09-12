@@ -228,14 +228,51 @@ The system includes a resilient multi-provider LLM router supporting priority or
   - **Google Gemini**: Gemini 1.5 Pro / Flash (`gemini-1.5-pro`, `gemini-1.5-flash`)
   - **Groq**: Fast open-weights inference (`llama-3.3-70b-versatile`)
 - **Priority-Ordered Fallback**: Configured via `LLM_PROVIDER_ORDER=anthropic,openai,gemini,groq`. If the primary provider encounters rate limits (`HTTP 429`), timeouts, quota limits, or 5xx server errors, the router logs the incident and transparently falls back to the next provider in the chain.
-- **Key-Based Eligibility**: Providers are dynamically filtered based on configured API keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`). If all configured providers fail, a comprehensive `AllProvidersFailedError` is raised.
+---
+
+## ✍️ Safe Write Operations Flow (Opt-In Data Modification)
+
+The system provides a distinct, opt-in path for data modification statements (`INSERT`, `UPDATE`, `DELETE`) with strict guardrails, isolated completely from the default read-only execution path:
+
+```
+Step 1: User Request -> POST /ask/write
+                        ├── Checks connection allow_writes == true
+                        ├── AST Validation (Only INSERT/UPDATE/DELETE; WHERE strictly required)
+                        ├── Dry-Run Preview (Runs equivalent SELECT without mutating data)
+                        └── Returns Preview Rows + 5-Minute Signed Preview Token
+
+Step 2: Review & Approval -> POST /ask/write/confirm {preview_token}
+                             ├── Cryptographically validates token & expiry
+                             ├── Re-validates Write AST before execution
+                             ├── Executes inside an explicit Database Transaction (ACID)
+                             ├── Commits on success; Rolls back on any failure
+                             └── Audits execution with write flag & affected row count
+```
+
+### Key Safety Guarantees & Constraints:
+1. **Opt-In Per Connection (`allow_writes: bool`)**:
+   - Write operations are disabled by default (`allow_writes=False`).
+   - `POST /ask/write` strictly rejects mutating requests against connections where `allow_writes` is `false`.
+2. **Dedicated Write-Capable Role Requirement**:
+   - Write confirmation connects using an explicitly-provisioned write-capable database user/role (configured in the connection string or via `DATABASE_URL`), strictly separated from the read-only database role used by `POST /ask` and preview steps.
+3. **Mandatory `WHERE` Clauses**:
+   - `UPDATE` and `DELETE` queries **strictly require a `WHERE` clause** at the AST validator level. Unconditional mass updates or mass deletes are rejected outright before ever reaching execution.
+4. **Zero Accidental Mutations (Dry-Run Preview)**:
+   - `POST /ask/write` never executes mutating SQL directly. For `UPDATE` and `DELETE`, it executes an equivalent read-only `SELECT * FROM <table> WHERE <conditions> LIMIT 100` against the read-only connection to return a preview of affected rows. For `INSERT`, it formats and returns the exact records to be inserted.
+5. **Token-Bound Confirmation & Re-Validation**:
+   - `POST /ask/write/confirm` requires a short-lived (5-minute) preview token bound to the exact SQL string. The SQL is re-validated through the write AST guardrail before transaction execution.
+6. **Transaction Isolation & Rollback**:
+   - Writes execute inside an explicit database transaction block (`BEGIN ... COMMIT`). If an error occurs, the transaction is immediately rolled back and the database state remains untouched.
+7. **Strict Write Audit Trail**:
+   - Every confirmed write is logged to the audit log (`app/audit.py`) with `is_write=1`, user ID, exact SQL statement, execution latency, and affected row count.
 
 ---
 
 ## 🧪 Testing
 
-Run the test suite with pytest (46 unit & integration tests):
+Run the full test suite with pytest (51 unit & integration tests):
 ```bash
 pytest -v -o asyncio_mode=auto
 ```
+
 
