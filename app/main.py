@@ -1,13 +1,15 @@
 from contextlib import asynccontextmanager
 import logging
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from app.agent import answer_question
+from app.audit import audit_logger
 from app.config import settings
 from app.db import check_db_connection, main_engine, readonly_engine
+from app.rate_limiter import rate_limit_dependency
 
 logging.basicConfig(
     level=logging.INFO if not settings.DEBUG else logging.DEBUG,
@@ -27,8 +29,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.APP_NAME,
-    version="0.1.0",
-    description="Production-ready Text-to-SQL Agent with Schema-Linking, Guardrails, and Self-Correction",
+    version="0.2.0",
+    description="Production-ready Text-to-SQL Agent with AST Validation, Dialect Enforcement, Safety Guardrails, and Self-Correction",
     lifespan=lifespan,
 )
 
@@ -52,6 +54,9 @@ class AskResponse(BaseModel):
     final_sql: Optional[str]
     rows: List[Dict[str, Any]]
     columns: List[str]
+    total_tokens_used: Optional[int] = 0
+    estimated_cost_usd: Optional[float] = 0.0
+    total_latency_ms: Optional[float] = 0.0
 
 
 @app.get("/")
@@ -60,7 +65,8 @@ async def root():
         "service": settings.APP_NAME,
         "status": "online",
         "sql_dialect": settings.SQL_DIALECT,
-        "version": "0.1.0",
+        "version": "0.2.0",
+        "rate_limit_per_minute": settings.RATE_LIMIT_PER_MINUTE,
     }
 
 
@@ -73,16 +79,17 @@ async def health_check():
         "database": db_health,
         "llm_provider": settings.LLM_PROVIDER,
         "llm_model": settings.LLM_MODEL,
+        "rate_limit_per_minute": settings.RATE_LIMIT_PER_MINUTE,
     }
 
 
-@app.post("/ask", response_model=AskResponse)
+@app.post("/ask", response_model=AskResponse, dependencies=[Depends(rate_limit_dependency)])
 async def ask(request: AskRequest):
-    """Processes a natural language question through the 4-step plan-generate-execute-retry-synthesize agent loop."""
+    """Processes a question through the guarded agent loop with rate limiting, AST verification, and audit tracking."""
     try:
         result = await answer_question(
             question=request.question,
-            max_retries=request.max_retries or 3,
+            max_retries=request.max_retries or settings.MAX_RETRIES,
         )
         return AskResponse(
             answer=result["answer"],
@@ -90,7 +97,16 @@ async def ask(request: AskRequest):
             final_sql=result["final_sql"],
             rows=result["rows"],
             columns=result["columns"],
+            total_tokens_used=result.get("total_tokens_used", 0),
+            estimated_cost_usd=result.get("estimated_cost_usd", 0.0),
+            total_latency_ms=result.get("total_latency_ms", 0.0),
         )
     except Exception as e:
         logger.error(f"Unhandled error answering question: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/audit")
+async def get_audit_logs(limit: int = 50):
+    """Fetches recent audit log attempts for compliance review."""
+    return {"logs": audit_logger.get_recent_logs(limit=limit)}

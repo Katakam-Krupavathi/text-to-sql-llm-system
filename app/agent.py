@@ -1,12 +1,15 @@
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 from sqlalchemy import text
+from app.audit import audit_logger, calculate_cost, estimate_tokens
 from app.config import settings
 from app.db import readonly_engine
 from app.llm import llm_client
 from app.retrieval import relevant_schema, retrieve_golden_queries, DEFAULT_TABLE_SCHEMAS
+from app.validator import validate_and_normalize_sql
 
 # Backward compatibility alias
 SAMPLE_SCHEMA = "\n\n".join([d["ddl"] for d in DEFAULT_TABLE_SCHEMAS.values()])
@@ -38,30 +41,27 @@ async def plan(
     few_shot_examples: Optional[List[dict]] = None,
     error_context: Optional[str] = None,
 ) -> dict:
-    """Step 1: Calls LLM to produce a structured plan and SQL query with schema-linking and few-shot grounding."""
-    # Retrieve relevant schema with value hints if not provided explicitly
+    """Step 1: Calls LLM with dialect enforcement, grounded schema, and few-shot examples."""
     if not schema:
         schema = relevant_schema(question, top_k=5)
 
-    # Retrieve golden few-shot examples if not provided
     if few_shot_examples is None:
         few_shot_examples = retrieve_golden_queries(question, top_k=2)
 
-    system_prompt = f"""You are an expert SQL engineer. Your target dialect is {settings.SQL_DIALECT.upper()}.
-Given a relevant database schema (including column types and sample distinct values) and a user question, your task is to:
-1. Reason step-by-step in `reasoning_plan` about which tables, joins, columns, filters, and aggregations are required.
-2. Ground user business terms using the provided column sample values (e.g. if the user asks for 'discontinued products', look for boolean/status column values).
-3. Produce a valid, syntactically correct {settings.SQL_DIALECT.upper()} SELECT query in `sql_query`.
+    system_prompt = f"""You are an expert SQL engineer. Your target database dialect is strictly {settings.SQL_DIALECT.upper()}.
+CRITICAL SAFETY & DIALECT INSTRUCTIONS:
+- You MUST produce syntactically valid {settings.SQL_DIALECT.upper()} SQL queries.
+- Do NOT use constructs from other dialects (e.g., do NOT use SQL Server 'TOP n' or 'DATEDIFF', do NOT use Oracle 'NVL').
+- Generate ONLY read-only SELECT or WITH ... SELECT queries.
+- NEVER generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, GRANT, REVOKE, or administrative commands.
+- Return ONLY a valid JSON object with the exact keys: "reasoning_plan", "sql_dialect", and "sql_query".
 
-Rules:
-- Generate ONLY SELECT or WITH ... SELECT queries. Never generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, etc.
-- Return ONLY a valid JSON object with the following structure:
+Output Format JSON:
 {{
-  "reasoning_plan": "Short chain-of-thought describing tables, joins, filters needed before writing SQL.",
+  "reasoning_plan": "Short chain-of-thought planning which tables, joins, filters, and aggregations to use.",
   "sql_dialect": "{settings.SQL_DIALECT}",
   "sql_query": "SELECT ...;"
 }}
-Do NOT wrap output in anything other than the JSON object.
 """
 
     examples_block = ""
@@ -84,10 +84,10 @@ User Question:
 """
     if error_context:
         prompt += f"""
-Previous Attempt Failed with Error:
+Previous Attempt Failed:
 {error_context}
 
-Please review the error carefully, diagnose what went wrong in your previous reasoning or column/table names, and produce a corrected plan and SQL query.
+Please review the error carefully, diagnose what went wrong in your previous SQL or dialect syntax, and produce a corrected plan and SQL query.
 """
 
     raw_response = await llm_client.generate(prompt=prompt, system_prompt=system_prompt)
@@ -101,52 +101,27 @@ Please review the error carefully, diagnose what went wrong in your previous rea
 
 
 def validate_is_select_query(query: str) -> None:
-    """Ensures the query is strictly a read-only SELECT statement."""
-    cleaned = query.strip()
-    cleaned = re.sub(r"^--.*$", "", cleaned, flags=re.MULTILINE).strip()
-    cleaned = re.sub(r"^/\*.*?\*/", "", cleaned, flags=re.DOTALL).strip()
-
-    statements = [s.strip() for s in cleaned.split(";") if s.strip()]
-    if len(statements) > 1:
-        raise ValueError("Multiple SQL statements in a single execution are prohibited.")
-
-    first_stmt = statements[0] if statements else ""
-    first_token = first_stmt.split()[0].upper() if first_stmt.split() else ""
-
-    if first_token not in ("SELECT", "WITH"):
-        raise ValueError(
-            f"Only read-only SELECT queries are allowed. Forbidden statement type: {first_token}"
-        )
-
-    forbidden_patterns = [
-        r"\bINSERT\s+INTO\b",
-        r"\bUPDATE\s+",
-        r"\bDELETE\s+FROM\b",
-        r"\bDROP\s+",
-        r"\bALTER\s+",
-        r"\bTRUNCATE\s+",
-        r"\bGRANT\s+",
-        r"\bREVOKE\s+",
-        r"\bEXEC\s+",
-        r"\bEXECUTE\s+",
-    ]
-    for pattern in forbidden_patterns:
-        if re.search(pattern, first_stmt, re.IGNORECASE):
-            raise ValueError(f"Query contains forbidden operation matching: {pattern}")
+    """AST validator checking that the query is strictly a read-only SELECT statement."""
+    is_valid, _, error_msg = validate_and_normalize_sql(query, target_dialect=settings.SQL_DIALECT)
+    if not is_valid:
+        raise ValueError(error_msg)
 
 
-async def execute_sql(query: str, max_rows: int = 500, timeout_seconds: int = 5) -> dict:
-    """Step 2: Runs the query against the read-only DB connection with safety constraints."""
-    try:
-        validate_is_select_query(query)
-    except ValueError as e:
+async def execute_sql(query: str, max_rows: int = settings.MAX_QUERY_ROWS, timeout_seconds: int = settings.QUERY_TIMEOUT_SECONDS) -> dict:
+    """Step 2: Validates AST with sqlglot and runs query against the read-only DB connection."""
+    # 1. AST and Dialect validation
+    is_valid, normalized_sql, validation_error = validate_and_normalize_sql(query, target_dialect=settings.SQL_DIALECT)
+    if not is_valid:
         return {
             "success": False,
             "rows": [],
             "columns": [],
-            "error": str(e),
+            "error": validation_error,
+            "ast_valid": False,
+            "dialect_valid": False,
         }
 
+    # 2. Execution against read-only engine
     try:
         async with readonly_engine.connect() as conn:
             try:
@@ -154,7 +129,7 @@ async def execute_sql(query: str, max_rows: int = 500, timeout_seconds: int = 5)
             except Exception:
                 pass
 
-            result = await conn.execute(text(query))
+            result = await conn.execute(text(normalized_sql))
             columns = list(result.keys()) if result.returns_rows else []
             raw_rows = result.fetchmany(max_rows) if result.returns_rows else []
 
@@ -165,6 +140,9 @@ async def execute_sql(query: str, max_rows: int = 500, timeout_seconds: int = 5)
                 "rows": rows,
                 "columns": columns,
                 "error": None,
+                "ast_valid": True,
+                "dialect_valid": True,
+                "normalized_sql": normalized_sql,
             }
     except Exception as e:
         logger.warning(f"SQL execution error for query '{query}': {e}")
@@ -173,6 +151,8 @@ async def execute_sql(query: str, max_rows: int = 500, timeout_seconds: int = 5)
             "rows": [],
             "columns": [],
             "error": str(e),
+            "ast_valid": True,
+            "dialect_valid": True,
         }
 
 
@@ -199,16 +179,19 @@ Synthesized Natural Language Answer:"""
     return response.strip()
 
 
-async def answer_question(question: str, max_retries: int = 3) -> dict:
-    """Step 3: Orchestrator loop managing grounded planning, execution, self-correction, and synthesis."""
-    # Retrieve relevant schema and few-shot golden queries for grounding
+async def answer_question(question: str, max_retries: int = settings.MAX_RETRIES) -> dict:
+    """Step 3: Orchestrator loop managing planning, AST guardrail validation, execution, self-correction, and audit."""
+    start_total_time = time.time()
     schema = relevant_schema(question, top_k=4)
     golden_examples = retrieve_golden_queries(question, top_k=2)
 
     sql_attempts = []
     error_context = None
+    total_tokens_used = 0
+    total_cost = 0.0
 
     for attempt in range(1, max_retries + 1):
+        attempt_start = time.time()
         try:
             plan_result = await plan(
                 question=question,
@@ -218,6 +201,7 @@ async def answer_question(question: str, max_retries: int = 3) -> dict:
             )
         except Exception as e:
             error_msg = f"Planning failed on attempt {attempt}: {str(e)}"
+            latency_ms = (time.time() - attempt_start) * 1000.0
             sql_attempts.append({
                 "attempt": attempt,
                 "reasoning_plan": None,
@@ -225,13 +209,35 @@ async def answer_question(question: str, max_retries: int = 3) -> dict:
                 "success": False,
                 "error": error_msg,
             })
+            audit_logger.log_attempt(
+                question=question,
+                attempt=attempt,
+                reasoning_plan=None,
+                sql_query=None,
+                sql_dialect=settings.SQL_DIALECT,
+                dialect_valid=False,
+                ast_valid=False,
+                execution_success=False,
+                error_message=error_msg,
+                latency_ms=latency_ms,
+            )
             error_context = error_msg
             continue
 
         reasoning_plan = plan_result.get("reasoning_plan")
         sql_query = plan_result.get("sql_query")
 
+        # Estimate tokens and cost for planning step
+        prompt_tokens = estimate_tokens(question + schema)
+        comp_tokens = estimate_tokens(reasoning_plan + (sql_query or ""))
+        step_tokens = prompt_tokens + comp_tokens
+        step_cost = calculate_cost(prompt_tokens, comp_tokens)
+        total_tokens_used += step_tokens
+        total_cost += step_cost
+
+        # Execute query (which includes AST & dialect validation)
         exec_result = await execute_sql(sql_query)
+        latency_ms = (time.time() - attempt_start) * 1000.0
 
         attempt_trace = {
             "attempt": attempt,
@@ -240,27 +246,56 @@ async def answer_question(question: str, max_retries: int = 3) -> dict:
             "success": exec_result["success"],
             "error": exec_result["error"],
             "row_count": len(exec_result["rows"]),
+            "ast_valid": exec_result.get("ast_valid", False),
+            "dialect_valid": exec_result.get("dialect_valid", False),
+            "latency_ms": round(latency_ms, 2),
         }
         sql_attempts.append(attempt_trace)
 
+        # Log to structured SQLite audit table
+        audit_logger.log_attempt(
+            question=question,
+            attempt=attempt,
+            reasoning_plan=reasoning_plan,
+            sql_query=sql_query,
+            sql_dialect=settings.SQL_DIALECT,
+            dialect_valid=exec_result.get("dialect_valid", False),
+            ast_valid=exec_result.get("ast_valid", False),
+            execution_success=exec_result["success"],
+            error_message=exec_result["error"],
+            latency_ms=latency_ms,
+            tokens_used=step_tokens,
+            cost_usd=step_cost,
+        )
+
         if exec_result["success"]:
+            # Synthesize final natural language answer
             answer_text = await synthesize_answer(
                 question=question,
                 columns=exec_result["columns"],
                 rows=exec_result["rows"],
             )
+            # Add synthesis tokens
+            synth_tokens = estimate_tokens(answer_text)
+            total_tokens_used += synth_tokens
+            total_cost += calculate_cost(estimate_tokens(question), synth_tokens)
+
             return {
                 "success": True,
                 "answer": answer_text,
                 "sql_attempts": sql_attempts,
-                "final_sql": sql_query,
+                "final_sql": exec_result.get("normalized_sql", sql_query),
                 "rows": exec_result["rows"],
                 "columns": exec_result["columns"],
+                "total_tokens_used": total_tokens_used,
+                "estimated_cost_usd": round(total_cost, 6),
+                "total_latency_ms": round((time.time() - start_total_time) * 1000.0, 2),
             }
         else:
+            # Provide error context for self-correction in next iteration
             error_context = (
                 f"SQL Query attempted:\n{sql_query}\n\n"
-                f"Database Error:\n{exec_result['error']}"
+                f"Validation/Database Error:\n{exec_result['error']}"
             )
 
     last_error = sql_attempts[-1]["error"] if sql_attempts else "Unknown error occurred."
@@ -276,4 +311,7 @@ async def answer_question(question: str, max_retries: int = 3) -> dict:
         "final_sql": sql_attempts[-1].get("sql_query") if sql_attempts else None,
         "rows": [],
         "columns": [],
+        "total_tokens_used": total_tokens_used,
+        "estimated_cost_usd": round(total_cost, 6),
+        "total_latency_ms": round((time.time() - start_total_time) * 1000.0, 2),
     }

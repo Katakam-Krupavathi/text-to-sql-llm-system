@@ -118,6 +118,37 @@ python -m app.index_schema
 
 ---
 
+## 🛡️ Safety, Correctness & Guardrails
+
+The system enforces multi-layered defense-in-depth across database access, query parsing, dialect compliance, and rate limiting:
+
+1. **Database-Level Read-Only Role**:
+   - `app/db.py` connects to PostgreSQL via a dedicated `sql_readonly` role (`READONLY_DATABASE_URL`).
+   - The user has only `SELECT` privileges on tables and sequences in `schema public`. Write, truncate, drop, and alter commands are revoked at the PostgreSQL engine level.
+
+2. **AST Parsing & Prohibited Statement Blocking (`sqlglot`)**:
+   - `app/validator.py` inspects the Abstract Syntax Tree (AST) using `sqlglot`.
+   - Rejects any query containing `Insert`, `Update`, `Delete`, `Drop`, `Alter`, `Create`, `Truncate`, `Grant`, `Revoke`, `Pragma`, or administrative commands.
+   - Blocks multiple statements in a single execution (`SELECT 1; DROP TABLE ...`).
+   - Blocks dangerous server-side functions (e.g., `pg_sleep`, `pg_terminate_backend`, `dblink`, `xp_cmdshell`).
+
+3. **Strict Dialect Enforcement**:
+   - The target dialect (`config.SQL_DIALECT`, default: `postgres`) is enforced in the prompt and verified via AST transpilation before execution.
+   - Non-compliant constructs (e.g. SQL Server `SELECT TOP 10` or `DATEDIFF` when targeting Postgres) are immediately caught and fed back into the self-correction retry loop.
+
+4. **Resource Bounds & Timeouts**:
+   - Hard row limit of 500 rows per query execution.
+   - 5-second database statement timeout (`SET LOCAL statement_timeout = 5000`).
+
+5. **Rate Limiting**:
+   - Sliding-window rate limiter per client IP (`RATE_LIMIT_PER_MINUTE`, default: 60 queries/min) returning `HTTP 429 Too Many Requests` when exceeded.
+
+6. **Structured Audit Logging & Cost Tracking**:
+   - Every question, plan, generated SQL, AST validation status, dialect check result, execution status, latency, token count, and cost estimate is logged into an append-only SQLite audit log (`vector_cache/audit.db`).
+   - Inspectable via `GET /audit?limit=50`.
+
+---
+
 ## 📡 API Endpoints
 
 ### `POST /ask`
@@ -142,7 +173,10 @@ Submit a natural language question to the database.
       "sql_query": "SELECT company_name FROM customers WHERE country = 'Germany';",
       "success": true,
       "error": null,
-      "row_count": 2
+      "row_count": 2,
+      "ast_valid": true,
+      "dialect_valid": true,
+      "latency_ms": 32.5
     }
   ],
   "final_sql": "SELECT company_name FROM customers WHERE country = 'Germany';",
@@ -150,18 +184,24 @@ Submit a natural language question to the database.
     {"company_name": "Alfreds Futterkiste"},
     {"company_name": "Blauer See Delikatessen"}
   ],
-  "columns": ["company_name"]
+  "columns": ["company_name"],
+  "total_tokens_used": 185,
+  "estimated_cost_usd": 0.00072,
+  "total_latency_ms": 412.0
 }
 ```
 
+### `GET /audit`
+Fetch recent audit log records for monitoring and compliance.
+
 ### `GET /health`
-Returns connection status to the database, target dialect, and LLM configuration.
+Returns connection status to the database, target dialect, rate limits, and LLM configuration.
 
 ---
 
 ## 🧪 Running Tests
 
-Run the test suite with pytest:
+Run the complete test suite with pytest:
 ```bash
 pytest -v -o asyncio_mode=auto
 ```
@@ -172,6 +212,6 @@ pytest -v -o asyncio_mode=auto
 - [x] **Phase 0**: Project skeleton, configuration, database pool & read-only setup
 - [x] **Phase 1**: Core 4-step plan-generate-execute-retry-synthesize loop & `/ask` endpoint
 - [x] **Phase 2**: Three layers of anti-hallucination grounding (Schema-linking + Value hinting + Golden queries)
-- [ ] **Phase 3**: Advanced SQL dialect enforcement & AST parsing
+- [x] **Phase 3**: Safety guardrails & dialect enforcement (read-only role, AST parser, rate limiter, audit log)
 - [ ] **Phase 4**: Evaluation harness & benchmarking
 
