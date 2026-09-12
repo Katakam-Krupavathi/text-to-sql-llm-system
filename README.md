@@ -29,55 +29,67 @@ A production-ready Text-to-SQL system featuring schema-linking retrieval, strict
 
 ---
 
-## 🚀 Quickstart & Setup
+## 🚀 Quickstart
 
-### 1. Prerequisites
+### 🐳 Option A: One-Command Docker Demo (Recommended)
+
+Start the entire stack (PostgreSQL, automatic schema seeding, read-only role provisioning, grounding index builder, FastAPI backend, and Streamlit UI) in one command:
+
+```bash
+# 1. Configure environment keys
+cp .env.example .env
+
+# 2. Launch the containerized stack
+make demo
+# Or: docker compose up --build
+```
+
+Access the applications at:
+- **Streamlit Web UI**: [http://localhost:8501](http://localhost:8501)
+- **FastAPI Documentation & Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **Health Check**: [http://localhost:8000/health](http://localhost:8000/health)
+
+To stop the stack:
+```bash
+make down
+```
+
+---
+
+### 💻 Option B: Local Development (Without Docker)
+
+#### 1. Prerequisites
 - Python 3.10+
-- PostgreSQL instance running locally or via Docker
+- PostgreSQL running locally or in a container
 
-### 2. Environment Setup
-
-Clone and install dependencies:
+#### 2. Environment Setup
 ```bash
 python -m venv env
 source env/bin/activate  # On Windows: env\Scripts\activate
 pip install -r requirements.txt
-```
-
-Create your `.env` configuration:
-```bash
 cp .env.example .env
 ```
 
-Edit `.env` to configure your database connection and LLM API keys:
-- `DATABASE_URL`: Main PostgreSQL async connection string (`postgresql+asyncpg://...`)
-- `READONLY_DATABASE_URL`: Restricted read-only user connection string
-- `SQL_DIALECT`: Explicit dialect target (default: `postgres`)
-- `LLM_PROVIDER`: `openai` or `anthropic`
-- `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`: Corresponding provider API key
-
-### 3. Database Initialization & Read-Only Role
-
-Seed the sample relational schema and data:
+#### 3. Database Initialization & Read-Only Role
 ```bash
+# Seed sample relational schema and data (Northwind/E-commerce)
 python scripts/seed_sample_db.py --dbname text_to_sql_db --user postgres --password postgres
-```
 
-Create a restricted `sql_readonly` user with database-level read-only permissions:
-```bash
+# Provision dedicated read-only role for safe query execution
 python scripts/setup_readonly_role.py --dbname text_to_sql_db --admin-user postgres --admin-password postgres
+
+# Profile data, generate value hints, and build grounding vector indexes
+python -m app.index_schema
 ```
 
-### 4. Running the Application
-
-Start the FastAPI development server:
+#### 4. Running the Backend and UI
 ```bash
+# Terminal 1: FastAPI Backend
 uvicorn app.main:app --reload --port 8000
-```
 
-Access the interactive API documentation at:
-- Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
-- Health Check: [http://localhost:8000/health](http://localhost:8000/health)
+# Terminal 2: Streamlit UI
+streamlit run app/ui.py
+```
 
 ---
 

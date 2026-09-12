@@ -1,3 +1,4 @@
+import os
 import uuid
 import httpx
 import pandas as pd
@@ -11,8 +12,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Backend API configuration
-API_BASE_URL = "http://localhost:8000"
+# Backend API configuration (supports Docker service discovery)
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
 
 # Initialize Session State
 if "session_id" not in st.session_state:

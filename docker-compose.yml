@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: text_to_sql_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: text_to_sql_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d text_to_sql_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  db-init:
+    build: .
+    container_name: text_to_sql_db_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@postgres:5432/text_to_sql_db
+      READONLY_DATABASE_URL: postgresql+asyncpg://sql_readonly:readonly_password@postgres:5432/text_to_sql_db
+      SQL_DIALECT: postgres
+    command: >
+      sh -c "
+        echo 'Seeding PostgreSQL database...' &&
+        python scripts/seed_sample_db.py --host postgres --port 5432 --dbname text_to_sql_db --user postgres --password postgrespassword &&
+        echo 'Setting up read-only role...' &&
+        python scripts/setup_readonly_role.py --host postgres --port 5432 --dbname text_to_sql_db --admin-user postgres --admin-password postgrespassword --readonly-user sql_readonly --readonly-password readonly_password &&
+        echo 'Building grounding indexes...' &&
+        python -m app.index_schema &&
+        echo 'Initialization completed successfully!'
+      "
+    restart: "no"
+
+  backend:
+    build: .
+    container_name: text_to_sql_backend
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@postgres:5432/text_to_sql_db
+      READONLY_DATABASE_URL: postgresql+asyncpg://sql_readonly:readonly_password@postgres:5432/text_to_sql_db
+      SQL_DIALECT: postgres
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      MAX_RETRIES: 3
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  ui:
+    build: .
+    container_name: text_to_sql_ui
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      API_BASE_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    command: ["streamlit", "run", "app/ui.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+
+volumes:
+  postgres_data:
