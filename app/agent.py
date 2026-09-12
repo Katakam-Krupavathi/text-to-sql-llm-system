@@ -8,10 +8,10 @@ from app.audit import audit_logger, calculate_cost, estimate_tokens
 from app.config import settings
 from app.db import readonly_engine
 from app.llm import llm_client
+from app.memory import memory_store
 from app.retrieval import relevant_schema, retrieve_golden_queries, DEFAULT_TABLE_SCHEMAS
 from app.validator import validate_and_normalize_sql
 
-# Backward compatibility alias
 SAMPLE_SCHEMA = "\n\n".join([d["ddl"] for d in DEFAULT_TABLE_SCHEMAS.values()])
 
 logger = logging.getLogger(__name__)
@@ -39,11 +39,14 @@ async def plan(
     question: str,
     schema: Optional[str] = None,
     few_shot_examples: Optional[List[dict]] = None,
+    conversation_history: Optional[str] = None,
     error_context: Optional[str] = None,
 ) -> dict:
-    """Step 1: Calls LLM with dialect enforcement, grounded schema, and few-shot examples."""
+    """Step 1: Calls LLM with conversation history, dialect enforcement, schema, and few-shot examples."""
     if not schema:
-        schema = relevant_schema(question, top_k=5)
+        # Combine question with conversation history for better schema retrieval on follow-ups
+        retrieval_query = f"{conversation_history or ''} {question}".strip()
+        schema = relevant_schema(retrieval_query, top_k=5)
 
     if few_shot_examples is None:
         few_shot_examples = retrieve_golden_queries(question, top_k=2)
@@ -54,6 +57,7 @@ CRITICAL SAFETY & DIALECT INSTRUCTIONS:
 - Do NOT use constructs from other dialects (e.g., do NOT use SQL Server 'TOP n' or 'DATEDIFF', do NOT use Oracle 'NVL').
 - Generate ONLY read-only SELECT or WITH ... SELECT queries.
 - NEVER generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, GRANT, REVOKE, or administrative commands.
+- If conversation history is provided, resolve follow-up references (e.g. 'that', 'those customers', 'now filter by...') by building upon the previous turn's intent and SQL query.
 - Return ONLY a valid JSON object with the exact keys: "reasoning_plan", "sql_dialect", and "sql_query".
 
 Output Format JSON:
@@ -76,7 +80,9 @@ Output Format JSON:
             )
         examples_block = "Here are examples of how similar questions were solved correctly before:\n" + "\n\n".join(examples_text) + "\n\n"
 
-    prompt = f"""{examples_block}Relevant Database Schema & Sample Values:
+    history_block = conversation_history or ""
+
+    prompt = f"""{examples_block}{history_block}Relevant Database Schema & Sample Values:
 {schema}
 
 User Question:
@@ -109,7 +115,6 @@ def validate_is_select_query(query: str) -> None:
 
 async def execute_sql(query: str, max_rows: int = settings.MAX_QUERY_ROWS, timeout_seconds: int = settings.QUERY_TIMEOUT_SECONDS) -> dict:
     """Step 2: Validates AST with sqlglot and runs query against the read-only DB connection."""
-    # 1. AST and Dialect validation
     is_valid, normalized_sql, validation_error = validate_and_normalize_sql(query, target_dialect=settings.SQL_DIALECT)
     if not is_valid:
         return {
@@ -121,7 +126,6 @@ async def execute_sql(query: str, max_rows: int = settings.MAX_QUERY_ROWS, timeo
             "dialect_valid": False,
         }
 
-    # 2. Execution against read-only engine
     try:
         async with readonly_engine.connect() as conn:
             try:
@@ -179,10 +183,19 @@ Synthesized Natural Language Answer:"""
     return response.strip()
 
 
-async def answer_question(question: str, max_retries: int = settings.MAX_RETRIES) -> dict:
-    """Step 3: Orchestrator loop managing planning, AST guardrail validation, execution, self-correction, and audit."""
+async def answer_question(
+    question: str,
+    session_id: Optional[str] = None,
+    max_retries: int = settings.MAX_RETRIES,
+) -> dict:
+    """Step 3: Orchestrator loop managing memory, planning, AST validation, execution, self-correction, and audit."""
     start_total_time = time.time()
-    schema = relevant_schema(question, top_k=4)
+    effective_session_id = memory_store.get_or_create_session_id(session_id)
+    history_context = memory_store.format_history_for_prompt(effective_session_id, limit=2)
+
+    # Grounding retrieval (incorporating history context)
+    retrieval_prompt = f"{history_context} {question}".strip()
+    schema = relevant_schema(retrieval_prompt, top_k=4)
     golden_examples = retrieve_golden_queries(question, top_k=2)
 
     sql_attempts = []
@@ -197,6 +210,7 @@ async def answer_question(question: str, max_retries: int = settings.MAX_RETRIES
                 question=question,
                 schema=schema,
                 few_shot_examples=golden_examples,
+                conversation_history=history_context,
                 error_context=error_context,
             )
         except Exception as e:
@@ -227,15 +241,13 @@ async def answer_question(question: str, max_retries: int = settings.MAX_RETRIES
         reasoning_plan = plan_result.get("reasoning_plan")
         sql_query = plan_result.get("sql_query")
 
-        # Estimate tokens and cost for planning step
-        prompt_tokens = estimate_tokens(question + schema)
+        prompt_tokens = estimate_tokens(question + schema + (history_context or ""))
         comp_tokens = estimate_tokens(reasoning_plan + (sql_query or ""))
         step_tokens = prompt_tokens + comp_tokens
         step_cost = calculate_cost(prompt_tokens, comp_tokens)
         total_tokens_used += step_tokens
         total_cost += step_cost
 
-        # Execute query (which includes AST & dialect validation)
         exec_result = await execute_sql(sql_query)
         latency_ms = (time.time() - attempt_start) * 1000.0
 
@@ -252,7 +264,6 @@ async def answer_question(question: str, max_retries: int = settings.MAX_RETRIES
         }
         sql_attempts.append(attempt_trace)
 
-        # Log to structured SQLite audit table
         audit_logger.log_attempt(
             question=question,
             attempt=attempt,
@@ -269,22 +280,31 @@ async def answer_question(question: str, max_retries: int = settings.MAX_RETRIES
         )
 
         if exec_result["success"]:
-            # Synthesize final natural language answer
+            final_sql = exec_result.get("normalized_sql", sql_query)
             answer_text = await synthesize_answer(
                 question=question,
                 columns=exec_result["columns"],
                 rows=exec_result["rows"],
             )
-            # Add synthesis tokens
             synth_tokens = estimate_tokens(answer_text)
             total_tokens_used += synth_tokens
             total_cost += calculate_cost(estimate_tokens(question), synth_tokens)
 
+            # Store completed turn into conversation memory
+            memory_store.add_turn(
+                session_id=effective_session_id,
+                question=question,
+                reasoning_plan=reasoning_plan,
+                sql_query=final_sql,
+                answer=answer_text,
+            )
+
             return {
                 "success": True,
+                "session_id": effective_session_id,
                 "answer": answer_text,
                 "sql_attempts": sql_attempts,
-                "final_sql": exec_result.get("normalized_sql", sql_query),
+                "final_sql": final_sql,
                 "rows": exec_result["rows"],
                 "columns": exec_result["columns"],
                 "total_tokens_used": total_tokens_used,
@@ -292,7 +312,6 @@ async def answer_question(question: str, max_retries: int = settings.MAX_RETRIES
                 "total_latency_ms": round((time.time() - start_total_time) * 1000.0, 2),
             }
         else:
-            # Provide error context for self-correction in next iteration
             error_context = (
                 f"SQL Query attempted:\n{sql_query}\n\n"
                 f"Validation/Database Error:\n{exec_result['error']}"
@@ -306,6 +325,7 @@ async def answer_question(question: str, max_retries: int = settings.MAX_RETRIES
 
     return {
         "success": False,
+        "session_id": effective_session_id,
         "answer": fallback_answer,
         "sql_attempts": sql_attempts,
         "final_sql": sql_attempts[-1].get("sql_query") if sql_attempts else None,

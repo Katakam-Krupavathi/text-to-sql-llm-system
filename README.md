@@ -152,44 +152,53 @@ The system enforces multi-layered defense-in-depth across database access, query
 ## 📡 API Endpoints
 
 ### `POST /ask`
-Submit a natural language question to the database.
+Submit a natural language question to the database. Supports multi-turn follow-up conversations using `session_id`.
 
-**Request:**
+**Turn 1: Initial Question**
 ```json
 {
-  "question": "Which customers are located in Germany?",
-  "max_retries": 3
+  "question": "What is the total freight shipping cost by country?",
+  "session_id": "user-session-123"
 }
 ```
 
-**Response:**
+**Response 1:**
 ```json
 {
-  "answer": "The customers located in Germany are Alfreds Futterkiste and Blauer See Delikatessen.",
-  "sql_attempts": [
-    {
-      "attempt": 1,
-      "reasoning_plan": "Filter customers table where country is Germany and select company_name.",
-      "sql_query": "SELECT company_name FROM customers WHERE country = 'Germany';",
-      "success": true,
-      "error": null,
-      "row_count": 2,
-      "ast_valid": true,
-      "dialect_valid": true,
-      "latency_ms": 32.5
-    }
-  ],
-  "final_sql": "SELECT company_name FROM customers WHERE country = 'Germany';",
+  "session_id": "user-session-123",
+  "answer": "Total freight by country: Germany is $84.55, Mexico is $77.44, Spain is $100.19, etc.",
+  "final_sql": "SELECT ship_country, SUM(freight) AS total_freight FROM orders GROUP BY ship_country;",
   "rows": [
-    {"company_name": "Alfreds Futterkiste"},
-    {"company_name": "Blauer See Delikatessen"}
+    {"ship_country": "Germany", "total_freight": 84.55},
+    {"ship_country": "Mexico", "total_freight": 77.44}
   ],
-  "columns": ["company_name"],
-  "total_tokens_used": 185,
-  "estimated_cost_usd": 0.00072,
-  "total_latency_ms": 412.0
+  "columns": ["ship_country", "total_freight"]
 }
 ```
+
+**Turn 2: Follow-up Question (Using Memory)**
+```json
+{
+  "question": "Now just show me that for Germany",
+  "session_id": "user-session-123"
+}
+```
+
+**Response 2:**
+```json
+{
+  "session_id": "user-session-123",
+  "answer": "The total freight shipping cost for Germany is $84.55.",
+  "final_sql": "SELECT ship_country, SUM(freight) AS total_freight FROM orders WHERE ship_country = 'Germany' GROUP BY ship_country;",
+  "rows": [
+    {"ship_country": "Germany", "total_freight": 84.55}
+  ],
+  "columns": ["ship_country", "total_freight"]
+}
+```
+
+### `DELETE /sessions/{session_id}`
+Clears conversation history for a specific session.
 
 ### `GET /audit`
 Fetch recent audit log records for monitoring and compliance.
@@ -213,5 +222,6 @@ pytest -v -o asyncio_mode=auto
 - [x] **Phase 1**: Core 4-step plan-generate-execute-retry-synthesize loop & `/ask` endpoint
 - [x] **Phase 2**: Three layers of anti-hallucination grounding (Schema-linking + Value hinting + Golden queries)
 - [x] **Phase 3**: Safety guardrails & dialect enforcement (read-only role, AST parser, rate limiter, audit log)
-- [ ] **Phase 4**: Evaluation harness & benchmarking
+- [x] **Phase 4**: Multi-turn conversation memory & follow-up reference resolution
+- [ ] **Phase 5**: Evaluation harness & benchmarking
 

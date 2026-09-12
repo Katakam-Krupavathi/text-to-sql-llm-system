@@ -9,6 +9,7 @@ from app.agent import answer_question
 from app.audit import audit_logger
 from app.config import settings
 from app.db import check_db_connection, main_engine, readonly_engine
+from app.memory import memory_store
 from app.rate_limiter import rate_limit_dependency
 
 logging.basicConfig(
@@ -29,8 +30,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.APP_NAME,
-    version="0.2.0",
-    description="Production-ready Text-to-SQL Agent with AST Validation, Dialect Enforcement, Safety Guardrails, and Self-Correction",
+    version="0.3.0",
+    description="Production-ready Text-to-SQL Agent with Conversation Memory, AST Validation, Dialect Enforcement, and Guardrails",
     lifespan=lifespan,
 )
 
@@ -45,10 +46,12 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     question: str = Field(..., description="Natural language question to ask the database", min_length=1)
+    session_id: Optional[str] = Field(default=None, description="Optional session ID for multi-turn conversation memory")
     max_retries: Optional[int] = Field(default=3, ge=1, le=5)
 
 
 class AskResponse(BaseModel):
+    session_id: str
     answer: str
     sql_attempts: List[Dict[str, Any]]
     final_sql: Optional[str]
@@ -65,7 +68,7 @@ async def root():
         "service": settings.APP_NAME,
         "status": "online",
         "sql_dialect": settings.SQL_DIALECT,
-        "version": "0.2.0",
+        "version": "0.3.0",
         "rate_limit_per_minute": settings.RATE_LIMIT_PER_MINUTE,
     }
 
@@ -85,13 +88,15 @@ async def health_check():
 
 @app.post("/ask", response_model=AskResponse, dependencies=[Depends(rate_limit_dependency)])
 async def ask(request: AskRequest):
-    """Processes a question through the guarded agent loop with rate limiting, AST verification, and audit tracking."""
+    """Processes a question through the guarded agent loop with multi-turn memory and rate limiting."""
     try:
         result = await answer_question(
             question=request.question,
+            session_id=request.session_id,
             max_retries=request.max_retries or settings.MAX_RETRIES,
         )
         return AskResponse(
+            session_id=result["session_id"],
             answer=result["answer"],
             sql_attempts=result["sql_attempts"],
             final_sql=result["final_sql"],
@@ -108,5 +113,12 @@ async def ask(request: AskRequest):
 
 @app.get("/audit")
 async def get_audit_logs(limit: int = 50):
-    """Fetches recent audit log attempts for compliance review."""
+    """Fetches recent audit log records for compliance review."""
     return {"logs": audit_logger.get_recent_logs(limit=limit)}
+
+
+@app.delete("/sessions/{session_id}")
+async def clear_session(session_id: str):
+    """Clears conversation memory for a specific session."""
+    memory_store.clear_session(session_id)
+    return {"message": f"Session {session_id} memory cleared."}
