@@ -253,6 +253,23 @@ Open [http://localhost:8501](http://localhost:8501) in your browser.
 
 ---
 
+## 📊 Evaluation & Benchmark Harness
+
+The repository includes an automated evaluation benchmark in [`scripts/run_eval.py`](file:///c:/Users/krupa/OneDrive/Desktop/projects/text-to-sql-llm-system/scripts/run_eval.py) implementing **Execution Accuracy (EX)** across a curated set of 22 test queries ([`tests/eval/eval_set.json`](file:///c:/Users/krupa/OneDrive/Desktop/projects/text-to-sql-llm-system/tests/eval/eval_set.json)).
+
+### How Execution Accuracy (EX) Works:
+1. The agent generates SQL for each test prompt via the 4-step grounded pipeline.
+2. Both the agent's SQL and the ground-truth gold SQL are executed against the database.
+3. Result sets are normalized and compared as order-independent multisets of tuples (verifying true semantic and data equivalence regardless of column ordering or alias differences).
+4. CI pipeline (`.github/workflows/eval.yml`) enforces a minimum pass threshold (default: **70% EX**).
+
+### Running Evaluation Benchmark Locally:
+```bash
+python scripts/run_eval.py --eval-set tests/eval/eval_set.json --threshold 0.70
+```
+
+---
+
 ## 🧪 Running Tests
 
 Run the complete test suite with pytest:
@@ -269,5 +286,5 @@ pytest -v -o asyncio_mode=auto
 - [x] **Phase 3**: Safety guardrails & dialect enforcement (read-only role, AST parser, rate limiter, audit log)
 - [x] **Phase 4**: Multi-turn conversation memory & follow-up reference resolution
 - [x] **Phase 5**: Interactive Streamlit UI with visible reasoning trace, auto-charting, and dataframes
-- [ ] **Phase 6**: Evaluation harness & benchmarking
+- [x] **Phase 6**: Evaluation harness (Execution Accuracy EX) & GitHub Actions CI gating
 
