@@ -1,0 +1,55 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Environment variables & credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+env.bak/
+venv.bak/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Vector database indexes & local caches
+vector_index/
+vector_cache/
+chroma_db/
+*.faiss
+*.pkl
+*.index
+
+# Local databases and temp files
+*.db
+*.sqlite
+*.sqlite3
+temp/
+tmp/
+*.log
+
+# IDE and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
