@@ -77,3 +77,37 @@ async def test_index_schema_cli_rebuild():
         await rebuild_all_indexes(verbose=False)
         assert len(retrieval_index.schema_index) > 0
         assert len(retrieval_index.golden_index) > 0
+
+
+def test_openai_dense_embedding_backend():
+    """Test (e): Verifies dense cosine similarity with mocked OpenAI embedding backend."""
+    from unittest.mock import MagicMock
+    from app.config import settings
+    from app.retrieval import compute_openai_embedding, dense_cosine_similarity, relevant_schema
+
+    with patch.object(settings, "EMBEDDING_BACKEND", "openai"), \
+         patch.object(settings, "OPENAI_API_KEY", "test-openai-key"), \
+         patch("openai.OpenAI") as mock_openai_cls:
+
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_item = MagicMock()
+        mock_item.embedding = [0.1, 0.2, 0.3, 0.4]
+        mock_response.data = [mock_item]
+        mock_client.embeddings.create.return_value = mock_response
+        mock_openai_cls.return_value = mock_client
+
+        # Test embedding computation
+        vec = compute_openai_embedding("Sample query text")
+        assert vec == [0.1, 0.2, 0.3, 0.4]
+
+        # Test dense cosine similarity
+        sim = dense_cosine_similarity([1.0, 0.0], [1.0, 0.0])
+        assert round(sim, 4) == 1.0
+
+        sim_ortho = dense_cosine_similarity([1.0, 0.0], [0.0, 1.0])
+        assert round(sim_ortho, 4) == 0.0
+
+        # Test relevant_schema retrieval with OpenAI backend enabled
+        schema_text = relevant_schema("Show customer records", top_k=2)
+        assert "Table: customers" in schema_text

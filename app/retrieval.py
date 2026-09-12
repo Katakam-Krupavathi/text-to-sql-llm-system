@@ -3,11 +3,10 @@ import logging
 import math
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from sqlalchemy import text
 from app.config import settings
 from app.db import readonly_engine
-from app.llm import llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +16,6 @@ GOLDEN_INDEX_PATH = os.path.join(CACHE_DIR, "golden_index.json")
 VALUE_HINTS_PATH = os.path.join(CACHE_DIR, "value_hints.json")
 GOLDEN_QUERIES_FILE = "data/golden_queries.json"
 
-# Default fallback table schema with sample value hints
 DEFAULT_TABLE_SCHEMAS = {
     "categories": {
         "description": "Product categories grouping items like Beverages, Condiments, Confections, Dairy Products, Seafood, etc.",
@@ -46,15 +44,17 @@ DEFAULT_TABLE_SCHEMAS = {
 }
 
 
+# --- Keyword (Sparse TF-IDF / Token Frequency) Vector Utilities ---
+
 def _tokenize(text_str: str) -> List[str]:
-    """Extracts lowercase alphanumeric tokens and bigrams for vector weighting."""
+    """Extracts lowercase alphanumeric tokens and bigrams for sparse keyword vector weighting."""
     tokens = re.findall(r"\b[a-z0-9_]+\b", text_str.lower())
     bigrams = [f"{tokens[i]}_{tokens[i+1]}" for i in range(len(tokens) - 1)]
     return tokens + bigrams
 
 
-def compute_vector(text_str: str) -> Dict[str, float]:
-    """Computes a normalized sparse term-frequency vector representation."""
+def compute_keyword_vector(text_str: str) -> Dict[str, float]:
+    """Computes a normalized sparse keyword vector representation (unigrams + bigrams)."""
     tokens = _tokenize(text_str)
     if not tokens:
         return {}
@@ -62,23 +62,54 @@ def compute_vector(text_str: str) -> Dict[str, float]:
     for t in tokens:
         counts[t] = counts.get(t, 0.0) + 1.0
 
-    # L2 normalize
     norm = math.sqrt(sum(v * v for v in counts.values()))
     if norm == 0.0:
         return {}
     return {k: v / norm for k, v in counts.items()}
 
 
-def cosine_similarity(vec_a: Dict[str, float], vec_b: Dict[str, float]) -> float:
-    """Computes cosine similarity between two normalized sparse vectors."""
+def sparse_cosine_similarity(vec_a: Dict[str, float], vec_b: Dict[str, float]) -> float:
+    """Computes cosine similarity between two normalized sparse keyword vectors."""
     if not vec_a or not vec_b:
         return 0.0
     common_keys = set(vec_a.keys()) & set(vec_b.keys())
     return sum(vec_a[k] * vec_b[k] for k in common_keys)
 
 
+# --- Dense OpenAI Embeddings Utilities ---
+
+def compute_openai_embedding(text_str: str) -> Optional[List[float]]:
+    """Generates dense vector embeddings using OpenAI API if configured."""
+    if not settings.OPENAI_API_KEY:
+        return None
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        response = client.embeddings.create(
+            input=text_str,
+            model=settings.OPENAI_EMBEDDING_MODEL,
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        logger.warning(f"OpenAI embedding generation failed: {e}. Falling back to keyword vector.")
+        return None
+
+
+def dense_cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+    """Computes cosine similarity between two dense float vectors."""
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    dot_product = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot_product / (norm_a * norm_b)
+
+
 class RetrievalIndex:
-    """Manages vector indexing and retrieval for schema-linking and golden queries."""
+    """Manages structural schema-linking and golden query retrieval via keyword vectors or OpenAI dense embeddings."""
 
     def __init__(self):
         self.schema_index: Dict[str, dict] = {}
@@ -87,23 +118,22 @@ class RetrievalIndex:
         self._load_cached_indexes()
 
     def _load_cached_indexes(self):
-        """Loads indexes from disk cache if present, otherwise defaults."""
+        """Loads index metadata from cache or initializes defaults."""
         os.makedirs(CACHE_DIR, exist_ok=True)
         if os.path.exists(VALUE_HINTS_PATH):
             try:
                 with open(VALUE_HINTS_PATH, "r", encoding="utf-8") as f:
                     self.value_hints = json.load(f)
             except Exception as e:
-                logger.warning(f"Failed to load value hints from {VALUE_HINTS_PATH}: {e}")
+                logger.warning(f"Failed to load value hints: {e}")
 
         if os.path.exists(SCHEMA_INDEX_PATH):
             try:
                 with open(SCHEMA_INDEX_PATH, "r", encoding="utf-8") as f:
                     self.schema_index = json.load(f)
             except Exception as e:
-                logger.warning(f"Failed to load schema index from {SCHEMA_INDEX_PATH}: {e}")
+                logger.warning(f"Failed to load schema index: {e}")
         else:
-            # Populate default schema index
             self._build_default_schema_index()
 
         if os.path.exists(GOLDEN_INDEX_PATH):
@@ -111,55 +141,61 @@ class RetrievalIndex:
                 with open(GOLDEN_INDEX_PATH, "r", encoding="utf-8") as f:
                     self.golden_index = json.load(f)
             except Exception as e:
-                logger.warning(f"Failed to load golden query index from {GOLDEN_INDEX_PATH}: {e}")
+                logger.warning(f"Failed to load golden index: {e}")
         else:
             self._build_default_golden_index()
 
     def _build_default_schema_index(self):
-        """Initializes schema index from DEFAULT_TABLE_SCHEMAS."""
         self.schema_index = {}
         for table_name, data in DEFAULT_TABLE_SCHEMAS.items():
             combined_text = f"{table_name} {data['description']} {data['ddl']}"
-            vec = compute_vector(combined_text)
+            kw_vec = compute_keyword_vector(combined_text)
+            dense_vec = None
+            if settings.EMBEDDING_BACKEND == "openai" and settings.OPENAI_API_KEY:
+                dense_vec = compute_openai_embedding(combined_text)
+
             self.schema_index[table_name] = {
                 "table_name": table_name,
                 "description": data["description"],
                 "ddl": data["ddl"],
-                "vector": vec,
+                "keyword_vector": kw_vec,
+                "dense_vector": dense_vec,
             }
 
     def _build_default_golden_index(self):
-        """Initializes golden query index from data/golden_queries.json."""
         self.golden_index = []
         if os.path.exists(GOLDEN_QUERIES_FILE):
             try:
                 with open(GOLDEN_QUERIES_FILE, "r", encoding="utf-8") as f:
                     queries = json.load(f)
                 for item in queries:
-                    vec = compute_vector(item["question"] + " " + item.get("reasoning", ""))
+                    comb_text = item["question"] + " " + item.get("reasoning", "")
+                    kw_vec = compute_keyword_vector(comb_text)
+                    dense_vec = None
+                    if settings.EMBEDDING_BACKEND == "openai" and settings.OPENAI_API_KEY:
+                        dense_vec = compute_openai_embedding(comb_text)
+
                     self.golden_index.append({
                         "question": item["question"],
                         "sql": item["sql"],
                         "reasoning": item.get("reasoning", ""),
-                        "vector": vec,
+                        "keyword_vector": kw_vec,
+                        "dense_vector": dense_vec,
                     })
             except Exception as e:
                 logger.warning(f"Failed to build golden index: {e}")
 
     async def build_schema_index_from_db(self) -> Dict[str, dict]:
-        """Extracts schema from live DB, profiles value hints, generates table descriptions, and indexes them."""
         os.makedirs(CACHE_DIR, exist_ok=True)
         schema_data: Dict[str, dict] = {}
 
         try:
             async with readonly_engine.connect() as conn:
-                # Query columns
                 query = text("""
                     SELECT 
                         t.table_name, 
                         c.column_name, 
-                        c.data_type,
-                        c.is_nullable
+                        c.data_type
                     FROM information_schema.tables t
                     JOIN information_schema.columns c ON t.table_name = c.table_name
                     WHERE t.table_schema = 'public'
@@ -167,12 +203,11 @@ class RetrievalIndex:
                 """)
                 rows = (await conn.execute(query)).fetchall()
                 if not rows:
-                    logger.info("No tables found in DB, using default schema index.")
                     self._build_default_schema_index()
                     return self.schema_index
 
                 tables_cols: Dict[str, List[str]] = {}
-                for table_name, col_name, data_type, _ in rows:
+                for table_name, col_name, data_type in rows:
                     hint_str = ""
                     if table_name in self.value_hints and col_name in self.value_hints[table_name]:
                         samples = self.value_hints[table_name][col_name]
@@ -184,12 +219,17 @@ class RetrievalIndex:
                     ddl = f"Table: {t_name} (\n" + ",\n".join(col_lines) + "\n)"
                     desc = DEFAULT_TABLE_SCHEMAS.get(t_name, {}).get("description", f"Table containing {t_name} records.")
                     combined_text = f"{t_name} {desc} {ddl}"
-                    vec = compute_vector(combined_text)
+                    kw_vec = compute_keyword_vector(combined_text)
+                    dense_vec = None
+                    if settings.EMBEDDING_BACKEND == "openai" and settings.OPENAI_API_KEY:
+                        dense_vec = compute_openai_embedding(combined_text)
+
                     schema_data[t_name] = {
                         "table_name": t_name,
                         "description": desc,
                         "ddl": ddl,
-                        "vector": vec,
+                        "keyword_vector": kw_vec,
+                        "dense_vector": dense_vec,
                     }
 
                 self.schema_index = schema_data
@@ -203,24 +243,30 @@ class RetrievalIndex:
         return self.schema_index
 
     def build_golden_index(self) -> List[dict]:
-        """Indexes data/golden_queries.json and writes to cache."""
         self._build_default_golden_index()
         with open(GOLDEN_INDEX_PATH, "w", encoding="utf-8") as f:
             json.dump(self.golden_index, f, indent=2)
         return self.golden_index
 
     def relevant_schema(self, question: str, top_k: int = 6) -> str:
-        """Layer 1 + Layer 2: Retrieves the top_k most relevant tables and their columns with value hints."""
+        """Retrieves top_k relevant tables/columns with sample value hints using keyword or dense embeddings."""
         if not self.schema_index:
             self._build_default_schema_index()
 
-        q_vec = compute_vector(question)
+        use_openai = settings.EMBEDDING_BACKEND == "openai" and bool(settings.OPENAI_API_KEY)
+        q_dense = compute_openai_embedding(question) if use_openai else None
+        q_kw = compute_keyword_vector(question)
+
         scores: List[Tuple[float, str, dict]] = []
 
         for table_name, data in self.schema_index.items():
-            sim = cosine_similarity(q_vec, data.get("vector", {}))
-            
-            # Boost score if table name or singular form is explicitly in question text
+            if use_openai and q_dense and data.get("dense_vector"):
+                sim = dense_cosine_similarity(q_dense, data["dense_vector"])
+            else:
+                target_vec = data.get("keyword_vector") or data.get("vector", {})
+                sim = sparse_cosine_similarity(q_kw, target_vec)
+
+            # Heuristic boosting if table name is in question
             singular_name = table_name.rstrip("s")
             q_lower = question.lower()
             if table_name in q_lower or (len(singular_name) > 3 and singular_name in q_lower):
@@ -230,36 +276,40 @@ class RetrievalIndex:
 
         scores.sort(key=lambda x: x[0], reverse=True)
         top_tables = scores[:top_k]
-
-        # Return concatenated DDL definitions with value hints
         schema_blocks = [item[2]["ddl"] for item in top_tables]
         return "\n\n".join(schema_blocks)
 
     def retrieve_golden_queries(self, question: str, top_k: int = 2) -> List[dict]:
-        """Layer 3: Retrieves top_k most similar golden queries as few-shot examples."""
+        """Retrieves top_k most similar golden queries as few-shot examples."""
         if not self.golden_index:
             self._build_default_golden_index()
 
-        q_vec = compute_vector(question)
+        use_openai = settings.EMBEDDING_BACKEND == "openai" and bool(settings.OPENAI_API_KEY)
+        q_dense = compute_openai_embedding(question) if use_openai else None
+        q_kw = compute_keyword_vector(question)
+
         scores: List[Tuple[float, dict]] = []
 
         for item in self.golden_index:
-            sim = cosine_similarity(q_vec, item.get("vector", {}))
+            if use_openai and q_dense and item.get("dense_vector"):
+                sim = dense_cosine_similarity(q_dense, item["dense_vector"])
+            else:
+                target_vec = item.get("keyword_vector") or item.get("vector", {})
+                sim = sparse_cosine_similarity(q_kw, target_vec)
+
             scores.append((sim, item))
 
         scores.sort(key=lambda x: x[0], reverse=True)
         return [item[1] for item in scores[:top_k]]
 
 
-# Global retrieval instance
+# Global instance & helper functions
 retrieval_index = RetrievalIndex()
 
 
 def relevant_schema(question: str, top_k: int = 6) -> str:
-    """Helper function to retrieve relevant schema blocks."""
     return retrieval_index.relevant_schema(question, top_k=top_k)
 
 
 def retrieve_golden_queries(question: str, top_k: int = 2) -> List[dict]:
-    """Helper function to retrieve golden few-shot query examples."""
     return retrieval_index.retrieve_golden_queries(question, top_k=top_k)

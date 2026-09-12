@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.0
     MAX_RETRIES: int = 3
 
+    # Retrieval / Embedding Backend
+    EMBEDDING_BACKEND: Literal["keyword", "openai"] = "keyword"
+    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
