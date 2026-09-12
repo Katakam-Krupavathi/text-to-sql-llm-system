@@ -206,15 +206,3 @@ Run the test suite with pytest (38 unit & integration tests):
 pytest -v -o asyncio_mode=auto
 ```
 
----
-
-## 🗺️ Roadmap & Implementation Status
-
-- [x] **Phase 0**: Project skeleton, configuration, database connection pool & read-only setup
-- [x] **Phase 1**: Core 4-step plan-generate-execute-retry-synthesize loop & `POST /ask` endpoint
-- [x] **Phase 2**: Three layers of anti-hallucination grounding (Schema-linking + Value hinting + Golden queries)
-- [x] **Phase 3**: Safety guardrails & dialect enforcement (read-only role, AST parser, rate limiter, audit log)
-- [x] **Phase 4**: Multi-turn conversation memory & follow-up reference resolution
-- [x] **Phase 5**: Interactive Streamlit UI with visible reasoning trace, auto-charting, and dataframes
-- [x] **Phase 6**: Evaluation harness (Execution Accuracy EX) & GitHub Actions CI gating
-- [x] **Phase 7**: Docker containerization & one-command demo stack (`make demo`)
