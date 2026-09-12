@@ -7,7 +7,7 @@ from sqlalchemy import text
 from app.audit import audit_logger, calculate_cost, estimate_tokens
 from app.config import settings
 from app.db import readonly_engine
-from app.llm import llm_client
+from app.llm import llm_client, llm_router
 from app.memory import memory_store
 from app.retrieval import relevant_schema, retrieve_golden_queries, DEFAULT_TABLE_SCHEMAS
 from app.validator import validate_and_normalize_sql

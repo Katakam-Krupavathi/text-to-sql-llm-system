@@ -199,9 +199,23 @@ python scripts/run_eval.py --eval-set tests/eval/eval_set.json --threshold 0.70
 
 ---
 
+## 🔌 Multi-LLM Router & Fallback Chain
+
+The system includes a resilient multi-provider LLM router supporting priority ordering and automatic failover across major models:
+
+- **Supported Providers**:
+  - **Anthropic**: Claude 3.5 Sonnet (`claude-3-5-sonnet-latest`)
+  - **OpenAI**: GPT-4o / GPT-4o Mini (`gpt-4o`, `gpt-4o-mini`)
+  - **Google Gemini**: Gemini 1.5 Pro / Flash (`gemini-1.5-pro`, `gemini-1.5-flash`)
+  - **Groq**: Fast open-weights inference (`llama-3.3-70b-versatile`)
+- **Priority-Ordered Fallback**: Configured via `LLM_PROVIDER_ORDER=anthropic,openai,gemini,groq`. If the primary provider encounters rate limits (`HTTP 429`), timeouts, quota limits, or 5xx server errors, the router logs the incident and transparently falls back to the next provider in the chain.
+- **Key-Based Eligibility**: Providers are dynamically filtered based on configured API keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`). If all configured providers fail, a comprehensive `AllProvidersFailedError` is raised.
+
+---
+
 ## 🧪 Testing
 
-Run the test suite with pytest (38 unit & integration tests):
+Run the test suite with pytest (41 unit & integration tests):
 ```bash
 pytest -v -o asyncio_mode=auto
 ```
