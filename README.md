@@ -192,10 +192,14 @@ curl -X POST http://localhost:8000/ask \
 ## 🖥️ Streamlit Web Interface
 
 Launch with `streamlit run app/ui.py`:
-- **Visible Reasoning Trace**: Expandable dropdown showing the retrieved schema, chain-of-thought plan, SQL attempts, and final verified SQL.
-- **Interactive Dataframes**: Full tabular result viewer.
-- **Auto-Charting**: Automatic bar charts and line charts for numeric query outputs.
-- **Performance Badges**: Attempt counts, self-correction indicator, latency, and token cost.
+- **Cohesive Slate/Dark Theme**: Styled developer visual identity configured via `.streamlit/config.toml`.
+- **Custom Chat Avatars & Subtitles**: Distinct user (`🧑‍💻`) and assistant (`🤖`) chat bubbles and architecture headers.
+- **Interactive Multi-Tenant Auth**: Seamless sidebar Login & Registration tabs with JWT session management and token swap expanders.
+- **Structured Sidebar Containers**: Organized `st.container(border=True)` cards for system health, user auth, connection switcher, session memory reset, and collapsed sample questions.
+- **✍️ Data Modification Mode (Opt-In Safe Writes)**: Toggle between read-only questions and mutating queries with chain-of-thought plans, AST-validated SQL, tabular previews ("nothing changed yet"), estimated affected rows, and one-click **"Confirm & Execute Write"** (with audit logging) / **"Discard"** action buttons.
+- **Visible Reasoning Trace**: Expandable dropdown showing chain-of-thought plans, per-attempt self-corrections, and verified SQL.
+- **Interactive Dataframes & Auto-Charting**: Tabular result viewer with automatic bar and trend line charts for numeric query outputs.
+- **Performance Badges**: Attempt counts, self-correction indicator, latency in ms, and token cost breakdown.
 
 ---
 

@@ -464,6 +464,10 @@ st.title("🤖 Enterprise Text-to-SQL Agent")
 st.markdown("##### *FastAPI + Multi-LLM Fallback Router + AST-Guarded SQL Execution*")
 st.caption("Natural language SQL engine with AST safety guardrails, schema grounding, dialect enforcement, and multi-turn memory.")
 
+# Chat Message Avatars
+USER_AVATAR = "🧑‍💻"
+ASSISTANT_AVATAR = "🤖"
+
 # Mode Toggle (Read-Only Query vs Data Modification)
 write_mode = st.toggle(
     "✍️ Data Modification Mode (INSERT / UPDATE / DELETE)",
@@ -476,7 +480,7 @@ if write_mode:
 
 # Render Chat History
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
+    with st.chat_message(msg["role"], avatar=USER_AVATAR if msg["role"] == "user" else ASSISTANT_AVATAR):
         if msg["role"] == "user":
             st.markdown(msg["content"])
         else:
@@ -492,11 +496,11 @@ if "preset_query" in st.session_state:
 if user_input:
     # 1. Display user message
     st.session_state.messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
+    with st.chat_message("user", avatar=USER_AVATAR):
         st.markdown(user_input)
 
     # 2. Query Agent Backend with spinner
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
         if write_mode:
             with st.spinner("Analyzing schema, planning safe write operation, and generating preview..."):
                 response_data, error_msg = send_write_query_to_backend(
