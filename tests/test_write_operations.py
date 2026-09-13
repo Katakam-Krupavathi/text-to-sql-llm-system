@@ -304,3 +304,52 @@ def test_preview_token_replay_rejected(client, temp_write_db):
     conn.close()
     assert final_stock == 20
 
+
+def test_preview_and_confirm_target_database_consistency(client, temp_write_db):
+    """Asserts confirm_write resolves to and executes against the identical engine/db_target that produced preview."""
+    db_uri, db_file = temp_write_db
+
+    reg_resp = client.post("/auth/register", json={"email": "target_user@example.com", "password": "Password123!"})
+    token = reg_resp.json()["access_token"]
+    user_id = reg_resp.json()["user_id"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    conn_resp = client.post(
+        "/connections",
+        json={"nickname": "Inventory DB", "dialect": "sqlite", "connection_string": db_uri, "allow_writes": True},
+        headers=headers,
+    )
+    conn_id = conn_resp.json()["id"]
+
+    mock_plan = {
+        "reasoning_plan": "Update stock for Mouse",
+        "sql_dialect": "sqlite",
+        "sql_query": "UPDATE products SET stock = 100 WHERE product_id = 2",
+    }
+    with patch("app.main.plan_write", new=AsyncMock(return_value=mock_plan)):
+        preview_resp = client.post(
+            "/ask/write",
+            json={"question": "Set Mouse stock to 100", "connection_id": conn_id},
+            headers=headers,
+        )
+        assert preview_resp.status_code == 200
+        preview_token = preview_resp.json()["preview_token"]
+
+    # Decode and check db_target claim in preview_token
+    token_claims = jwt.decode(preview_token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+    assert token_claims["db_target"] == f"connection:{conn_id}"
+
+    # Confirm executes against the identical target
+    confirm_resp = client.post("/ask/write/confirm", json={"preview_token": preview_token}, headers=headers)
+    assert confirm_resp.status_code == 200
+
+    # Tampered db_target is rejected
+    tampered_payload = token_claims.copy()
+    tampered_payload["db_target"] = "connection:other-nonexistent-db-id"
+    tampered_payload["jti"] = "unique-jti-for-tampered"
+    tampered_token = jwt.encode(tampered_payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+    tampered_resp = client.post("/ask/write/confirm", json={"preview_token": tampered_token}, headers=headers)
+    assert tampered_resp.status_code in (400, 404)
+
+

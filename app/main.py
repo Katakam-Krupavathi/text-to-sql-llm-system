@@ -405,6 +405,7 @@ async def ask_write(
         target_dialect = conn_record["dialect"]
         target_conn_id = conn_record["id"]
         target_engine = get_engine_for_connection(target_conn_id, target_conn_str)
+        db_target = f"connection:{target_conn_id}"
     else:
         user_conns = get_connections_for_user(current_user["id"])
         if user_conns:
@@ -419,10 +420,13 @@ async def ask_write(
                 target_dialect = first_conn["dialect"]
                 target_conn_id = first_conn["id"]
                 target_engine = get_engine_for_connection(target_conn_id, target_conn_str)
+                db_target = f"connection:{target_conn_id}"
         else:
-            target_conn_str = settings.effective_readonly_db_url
+            target_conn_str = settings.DATABASE_URL
             target_dialect = settings.SQL_DIALECT
-            target_engine = readonly_engine
+            target_conn_id = None
+            target_engine = main_engine
+            db_target = "default_db"
 
     # 1. Generate plan for write operation
     try:
@@ -458,6 +462,7 @@ async def ask_write(
         "jti": str(uuid.uuid4()),
         "sub": current_user["id"],
         "connection_id": target_conn_id,
+        "db_target": db_target,
         "sql": normalized_sql,
         "operation": operation,
         "type": "write_preview",
@@ -497,6 +502,7 @@ async def confirm_write(
 
     sql_to_execute = payload.get("sql")
     target_conn_id = payload.get("connection_id")
+    token_db_target = payload.get("db_target")
     jti = payload.get("jti") or str(uuid.uuid4())
 
     # Check and enforce single-use token consumption
@@ -516,9 +522,18 @@ async def confirm_write(
         target_conn_str = decrypt_connection_string(conn_record["encrypted_connection_string"])
         target_dialect = conn_record["dialect"]
         write_engine = get_engine_for_connection(target_conn_id, target_conn_str)
+        derived_db_target = f"connection:{target_conn_id}"
     else:
         target_dialect = settings.SQL_DIALECT
         write_engine = main_engine
+        derived_db_target = "default_db"
+
+    # Verify db_target matches preview
+    if token_db_target and token_db_target != derived_db_target:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Database target mismatch: token previewed for '{token_db_target}' but execution target resolved to '{derived_db_target}'.",
+        )
 
     # 3. Re-validate write SQL before execution (never trust token blindly)
     is_valid, normalized_sql, validation_err = validate_write_sql(sql_to_execute, target_dialect=target_dialect)
