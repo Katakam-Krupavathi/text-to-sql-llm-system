@@ -152,6 +152,76 @@ with st.sidebar:
             st.rerun()
 
 
+def render_assistant_message(msg: dict):
+    """Renders a structured assistant response including answer, metrics badge, reasoning trace, data table, and charts."""
+    # Primary synthesized answer
+    if msg.get("answer"):
+        st.markdown(msg["answer"])
+
+    # Attempt / Retry Badge
+    attempts = msg.get("sql_attempts", [])
+    num_attempts = len(attempts)
+    if num_attempts > 0:
+        if num_attempts == 1:
+            st.caption(f"🎯 **Resolved on 1st attempt** | ⏱️ {msg.get('total_latency_ms', 0):.0f} ms | 🪙 {msg.get('total_tokens_used', 0)} tokens (${msg.get('estimated_cost_usd', 0):.5f})")
+        else:
+            st.caption(f"🔄 **Resolved in {num_attempts} attempts ({num_attempts - 1} self-corrections)** | ⏱️ {msg.get('total_latency_ms', 0):.0f} ms | 🪙 {msg.get('total_tokens_used', 0)} tokens")
+
+        # Thought Process / Reasoning Trace Expander
+        with st.expander("🔍 Thought Process & Agent Reasoning Trace", expanded=False):
+            for att in attempts:
+                att_num = att.get("attempt", 1)
+                st.markdown(f"#### 🧭 Attempt #{att_num}")
+                
+                if att.get("reasoning_plan"):
+                    st.markdown("**Reasoning Plan (Chain-of-Thought):**")
+                    st.info(att["reasoning_plan"])
+
+                if att.get("sql_query"):
+                    st.markdown("**Generated SQL Query:**")
+                    st.code(att["sql_query"], language="sql")
+
+                # AST & Execution Status
+                if att.get("success"):
+                    st.success(f"✓ Validated & Executed Successfully ({att.get('row_count', 0)} rows returned)")
+                else:
+                    st.error(f"✗ Execution Error / Failed Check: {att.get('error', 'Unknown failure')}")
+                
+                st.divider()
+
+            if msg.get("final_sql"):
+                st.markdown("#### ✅ Final Verified SQL")
+                st.code(msg["final_sql"], language="sql")
+
+    # Tabular Dataframe Output
+    rows = msg.get("rows", [])
+    if rows:
+        st.markdown("##### 📋 Data Results")
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True)
+
+        # Auto-Charting for numeric results (1-2 dimensions)
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        non_numeric_cols = df.select_dtypes(exclude=["number"]).columns.tolist()
+
+        if numeric_cols and len(df) > 1 and len(df) <= 50:
+            if non_numeric_cols:
+                dim_col = non_numeric_cols[0]
+                metric_col = numeric_cols[0]
+                st.markdown(f"##### 📊 Visual: `{metric_col}` by `{dim_col}`")
+                try:
+                    chart_df = df.set_index(dim_col)[[metric_col]]
+                    st.bar_chart(chart_df)
+                except Exception:
+                    pass
+            elif len(numeric_cols) >= 1:
+                st.markdown(f"##### 📊 Trend: `{numeric_cols[0]}`")
+                try:
+                    st.line_chart(df[numeric_cols[0]])
+                except Exception:
+                    pass
+
+
 # --- Main Chat UI ---
 st.title("🤖 Enterprise Text-to-SQL Agent")
 st.caption("Natural language SQL engine with AST safety guardrails, schema grounding, dialect enforcement, and multi-turn memory.")
@@ -162,70 +232,7 @@ for msg in st.session_state.messages:
         if msg["role"] == "user":
             st.markdown(msg["content"])
         else:
-            # Primary synthesized answer
-            st.markdown(msg["answer"])
-
-            # Attempt / Retry Badge
-            attempts = msg.get("sql_attempts", [])
-            num_attempts = len(attempts)
-            if num_attempts == 1:
-                st.caption(f"🎯 **Resolved on 1st attempt** | ⏱️ {msg.get('total_latency_ms', 0):.0f} ms | 🪙 {msg.get('total_tokens_used', 0)} tokens (${msg.get('estimated_cost_usd', 0):.5f})")
-            else:
-                st.caption(f"🔄 **Resolved in {num_attempts} attempts ({num_attempts - 1} self-corrections)** | ⏱️ {msg.get('total_latency_ms', 0):.0f} ms | 🪙 {msg.get('total_tokens_used', 0)} tokens")
-
-            # Thought Process / Reasoning Trace Expander
-            with st.expander("🔍 Thought Process & Agent Reasoning Trace", expanded=False):
-                for att in attempts:
-                    att_num = att.get("attempt", 1)
-                    st.markdown(f"#### 🧭 Attempt #{att_num}")
-                    
-                    if att.get("reasoning_plan"):
-                        st.markdown("**Reasoning Plan (Chain-of-Thought):**")
-                        st.info(att["reasoning_plan"])
-
-                    if att.get("sql_query"):
-                        st.markdown("**Generated SQL Query:**")
-                        st.code(att["sql_query"], language="sql")
-
-                    # AST & Execution Status
-                    if att.get("success"):
-                        st.success(f"✓ Validated & Executed Successfully ({att.get('row_count', 0)} rows returned)")
-                    else:
-                        st.error(f"✗ Execution Error / Failed Check: {att.get('error', 'Unknown failure')}")
-                    
-                    st.divider()
-
-                if msg.get("final_sql"):
-                    st.markdown("#### ✅ Final Verified SQL")
-                    st.code(msg["final_sql"], language="sql")
-
-            # Tabular Dataframe Output
-            rows = msg.get("rows", [])
-            if rows:
-                st.markdown("##### 📋 Data Results")
-                df = pd.DataFrame(rows)
-                st.dataframe(df, use_container_width=True)
-
-                # Auto-Charting for numeric results (1-2 dimensions)
-                numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-                non_numeric_cols = df.select_dtypes(exclude=["number"]).columns.tolist()
-
-                if numeric_cols and len(df) > 1 and len(df) <= 50:
-                    if non_numeric_cols:
-                        dim_col = non_numeric_cols[0]
-                        metric_col = numeric_cols[0]
-                        st.markdown(f"##### 📊 Visual: `{metric_col}` by `{dim_col}`")
-                        try:
-                            chart_df = df.set_index(dim_col)[[metric_col]]
-                            st.bar_chart(chart_df)
-                        except Exception:
-                            pass
-                    elif len(numeric_cols) >= 1:
-                        st.markdown(f"##### 📊 Trend: `{numeric_cols[0]}`")
-                        try:
-                            st.line_chart(df[numeric_cols[0]])
-                        except Exception:
-                            pass
+            render_assistant_message(msg)
 
 
 # Handle Chat Input (or Preset query)
@@ -260,67 +267,7 @@ if user_input:
                 "columns": [],
             })
         elif response_data:
-            # Display synthesized answer
-            st.markdown(response_data["answer"])
-
-            # Attempt Badge
-            attempts = response_data.get("sql_attempts", [])
-            num_attempts = len(attempts)
-            if num_attempts == 1:
-                st.caption(f"🎯 **Resolved on 1st attempt** | ⏱️ {response_data.get('total_latency_ms', 0):.0f} ms | 🪙 {response_data.get('total_tokens_used', 0)} tokens (${response_data.get('estimated_cost_usd', 0):.5f})")
-            else:
-                st.caption(f"🔄 **Resolved in {num_attempts} attempts ({num_attempts - 1} self-corrections)** | ⏱️ {response_data.get('total_latency_ms', 0):.0f} ms | 🪙 {response_data.get('total_tokens_used', 0)} tokens")
-
-            # Thought Process Expander
-            with st.expander("🔍 Thought Process & Agent Reasoning Trace", expanded=False):
-                for att in attempts:
-                    att_num = att.get("attempt", 1)
-                    st.markdown(f"#### 🧭 Attempt #{att_num}")
-                    if att.get("reasoning_plan"):
-                        st.markdown("**Reasoning Plan (Chain-of-Thought):**")
-                        st.info(att["reasoning_plan"])
-                    if att.get("sql_query"):
-                        st.markdown("**Generated SQL Query:**")
-                        st.code(att["sql_query"], language="sql")
-                    if att.get("success"):
-                        st.success(f"✓ Validated & Executed Successfully ({att.get('row_count', 0)} rows returned)")
-                    else:
-                        st.error(f"✗ Execution Error / Failed Check: {att.get('error', 'Unknown failure')}")
-                    st.divider()
-
-                if response_data.get("final_sql"):
-                    st.markdown("#### ✅ Final Verified SQL")
-                    st.code(response_data["final_sql"], language="sql")
-
-            # Tabular Output & Charting
-            rows = response_data.get("rows", [])
-            if rows:
-                st.markdown("##### 📋 Data Results")
-                df = pd.DataFrame(rows)
-                st.dataframe(df, use_container_width=True)
-
-                numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-                non_numeric_cols = df.select_dtypes(exclude=["number"]).columns.tolist()
-
-                if numeric_cols and len(df) > 1 and len(df) <= 50:
-                    if non_numeric_cols:
-                        dim_col = non_numeric_cols[0]
-                        metric_col = numeric_cols[0]
-                        st.markdown(f"##### 📊 Visual: `{metric_col}` by `{dim_col}`")
-                        try:
-                            chart_df = df.set_index(dim_col)[[metric_col]]
-                            st.bar_chart(chart_df)
-                        except Exception:
-                            pass
-                    elif len(numeric_cols) >= 1:
-                        st.markdown(f"##### 📊 Trend: `{numeric_cols[0]}`")
-                        try:
-                            st.line_chart(df[numeric_cols[0]])
-                        except Exception:
-                            pass
-
-            # Store in session state history
-            st.session_state.messages.append({
+            assistant_msg = {
                 "role": "assistant",
                 "answer": response_data["answer"],
                 "sql_attempts": response_data.get("sql_attempts", []),
@@ -330,4 +277,6 @@ if user_input:
                 "total_tokens_used": response_data.get("total_tokens_used", 0),
                 "estimated_cost_usd": response_data.get("estimated_cost_usd", 0.0),
                 "total_latency_ms": response_data.get("total_latency_ms", 0.0),
-            })
+            }
+            render_assistant_message(assistant_msg)
+            st.session_state.messages.append(assistant_msg)
