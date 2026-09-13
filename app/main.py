@@ -422,6 +422,11 @@ async def ask_write(
                 target_engine = get_engine_for_connection(target_conn_id, target_conn_str)
                 db_target = f"connection:{target_conn_id}"
         else:
+            if not settings.ALLOW_DEFAULT_DB_WRITES:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Writes against the default database are disabled. Configure a database connection with allow_writes=true, or set ALLOW_DEFAULT_DB_WRITES=true if you intend to allow writes against the primary application database.",
+                )
             target_conn_str = settings.DATABASE_URL
             target_dialect = settings.SQL_DIALECT
             target_conn_id = None
@@ -524,6 +529,11 @@ async def confirm_write(
         write_engine = get_engine_for_connection(target_conn_id, target_conn_str)
         derived_db_target = f"connection:{target_conn_id}"
     else:
+        if not settings.ALLOW_DEFAULT_DB_WRITES:
+            raise HTTPException(
+                status_code=403,
+                detail="Writes against the default database are disabled. Configure a database connection with allow_writes=true, or set ALLOW_DEFAULT_DB_WRITES=true if you intend to allow writes against the primary application database.",
+            )
         target_dialect = settings.SQL_DIALECT
         write_engine = main_engine
         derived_db_target = "default_db"

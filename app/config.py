@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     MAX_QUERY_ROWS: int = 500
     QUERY_TIMEOUT_SECONDS: int = 5
     AUDIT_LOG_DB_PATH: str = "vector_cache/audit.db"
+    ALLOW_DEFAULT_DB_WRITES: bool = False
 
     # Multi-Tenant Auth & Encryption Settings
     SECRET_KEY: str = "super-secret-text-to-sql-jwt-key-change-in-production"

@@ -353,3 +353,33 @@ def test_preview_and_confirm_target_database_consistency(client, temp_write_db):
     assert tampered_resp.status_code in (400, 404)
 
 
+def test_allow_default_db_writes_gate(client, monkeypatch):
+    """Asserts default-database write path is rejected when ALLOW_DEFAULT_DB_WRITES=False, permitted when True."""
+    reg_resp = client.post("/auth/register", json={"email": "default_gate_user@example.com", "password": "Password123!"})
+    token = reg_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1. Unset / False (Default): Must be rejected with 403
+    monkeypatch.setattr(settings, "ALLOW_DEFAULT_DB_WRITES", False)
+    mock_plan = {
+        "reasoning_plan": "Delete user 99",
+        "sql_dialect": "postgres",
+        "sql_query": "DELETE FROM users WHERE id = '99'",
+    }
+    with patch("app.main.plan_write", new=AsyncMock(return_value=mock_plan)):
+        reject_resp = client.post("/ask/write", json={"question": "Delete user 99"}, headers=headers)
+        assert reject_resp.status_code == 403
+        assert "Writes against the default database are disabled" in reject_resp.json()["detail"]
+
+    # 2. Permitted when ALLOW_DEFAULT_DB_WRITES = True
+    monkeypatch.setattr(settings, "ALLOW_DEFAULT_DB_WRITES", True)
+    with patch("app.main.plan_write", new=AsyncMock(return_value=mock_plan)), \
+         patch("app.main.generate_write_preview", new=AsyncMock(return_value=("DELETE", [], 0))):
+        allow_resp = client.post("/ask/write", json={"question": "Delete user 99"}, headers=headers)
+        assert allow_resp.status_code == 200
+        preview_token = allow_resp.json()["preview_token"]
+        claims = jwt.decode(preview_token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        assert claims["db_target"] == "default_db"
+
+
+
