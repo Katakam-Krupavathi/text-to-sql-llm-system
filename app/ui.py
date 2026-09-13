@@ -316,6 +316,9 @@ with st.sidebar:
                 st.session_state["preset_query"] = q
                 st.rerun()
 
+    st.divider()
+    st.caption("⚡ **Architecture:** FastAPI • Multi-LLM Router • AST Guardrails • Multi-Tenant BYODB")
+
 
 def render_assistant_message(msg: dict):
     """Renders a structured assistant response including answer, metrics badge, reasoning trace, data table, charts, or write preview."""
@@ -458,6 +461,7 @@ def render_assistant_message(msg: dict):
 
 # --- Main Chat UI ---
 st.title("🤖 Enterprise Text-to-SQL Agent")
+st.markdown("##### *FastAPI + Multi-LLM Fallback Router + AST-Guarded SQL Execution*")
 st.caption("Natural language SQL engine with AST safety guardrails, schema grounding, dialect enforcement, and multi-turn memory.")
 
 # Mode Toggle (Read-Only Query vs Data Modification)
