@@ -227,8 +227,12 @@ class LLMRouter:
                     system_prompt=system_prompt,
                     response_format=response_format,
                 )
-                if response:
+                if response and response.strip():
                     return response
+
+                err_str = f"Provider '{provider_name}' returned an empty response. Falling back to next provider..."
+                logger.warning(f"LLM Fallback Triggered: {err_str}")
+                errors.append(f"Provider '{provider_name}' returned an empty response")
             except Exception as e:
                 err_str = f"Provider '{provider_name}' failed: {type(e).__name__} - {str(e)}"
                 logger.warning(f"LLM Fallback Triggered: {err_str}. Trying next provider in order...")

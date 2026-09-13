@@ -119,3 +119,38 @@ async def test_llm_router_skips_providers_without_api_keys():
         assert result == "OpenAI Response"
         assert provider_a.call_count == 0
         assert provider_b.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_llm_router_empty_response_fallback_and_warning(caplog):
+    """
+    Test: Provider A returns an empty or whitespace-only response, Provider B succeeds.
+    Confirms:
+    1. Returns Provider B's response.
+    2. Logs a warning stating Provider A returned an empty response.
+    3. Provider B is invoked.
+    """
+    router = LLMRouter()
+    provider_a = MockSuccessProvider("anthropic", "   ")
+    provider_b = MockSuccessProvider("openai", "SELECT COUNT(*) FROM orders;")
+
+    router.register_provider("anthropic", provider_a)
+    router.register_provider("openai", provider_b)
+
+    with patch.object(settings, "LLM_PROVIDER_ORDER", ["anthropic", "openai"]), \
+         patch.object(settings, "ANTHROPIC_API_KEY", "test-anthropic-key"), \
+         patch.object(settings, "OPENAI_API_KEY", "test-openai-key"), \
+         caplog.at_level(logging.WARNING):
+
+        result = await router.generate_with_fallback("Count orders")
+
+        assert result == "SELECT COUNT(*) FROM orders;"
+        assert provider_a.call_count == 1
+        assert provider_b.call_count == 1
+
+        # Check warning log for empty response
+        assert any(
+            "anthropic" in record.message and "returned an empty response" in record.message
+            for record in caplog.records
+        )
+
