@@ -12,59 +12,110 @@ A production-grade, self-correcting **Text-to-SQL system** engineered with multi
 
 ## 🏛️ System Architecture
 
-```text
-                                  +---------------------------------------+
-                                  |     Client (REST API / Streamlit)     |
-                                  +-------------------+-------------------+
-                                                      |
-                                                      v
-                                  +---------------------------------------+
-                                  |     🔐 Auth & JWT Gating Layer        |
-                                  |  (POST /auth/register, /auth/login)   |
-                                  +-------------------+-------------------+
-                                                      |
-                                                      v
-                                  +---------------------------------------+
-                                  |   📂 Per-User DatabaseConnection      |
-                                  |  - AES-256 Symmetric Decryption       |
-                                  |  - Dialect Resolution (PG/SQLite/etc) |
-                                  +-------------------+-------------------+
-                                                      |
-                       +------------------------------+------------------------------+
-                       |                                                             |
-                       v                                                             v
-       [📖 READ PATH: POST /ask]                                     [✍️ WRITE PATH: POST /ask/write]
-+---------------------------------------------+               +---------------------------------------------+
-| 🛡️ Isolated Grounding (Per-Connection)      |               | 1. Plan Write Query                         |
-| • Schema-Linking (Table/Column vectors)     |               |    • Strictly INSERT / UPDATE / DELETE      |
-| • Distinct Low-Cardinality Value Hints      |               |    • WHERE clause strictly required         |
-| • Few-Shot Golden Query Retrieval           |               |                                             |
-|                                             |               | 2. Write AST Validation (sqlglot)           |
-| 🔁 Agentic Self-Correction Loop             |               |    • Blocks DROP/ALTER/TRUNCATE/multi-stmt  |
-| 1. Plan SQL via Multi-LLM Router            |               |                                             |
-|    (Anthropic -> OpenAI -> Gemini -> Groq)  |               | 3. Dry-Run Preview (Read-Only Connection)   |
-| 2. Read-Only AST Guardrail (sqlglot)        |               |    • UPDATE/DELETE -> Runs SELECT preview   |
-| 3. Safe DB Execution (Read-Only Role)       |               |    • INSERT -> Formats prospective rows     |
-| 4. Self-Correction on Dialect/DB Error      |               |                                             |
-| 5. Synthesize Natural-Language Answer       |               | 4. Mint 5-Minute Signed Preview Token       |
-+----------------------+----------------------+               +----------------------+----------------------+
-                       |                                                             |
-                       |                                                             v (User reviews preview)
-                       |                                              +---------------------------------------------+
-                       |                                              | 🚀 POST /ask/write/confirm {preview_token}  |
-                       |                                              | • Cryptographically verifies token & expiry |
-                       |                                              | • Re-validates Write AST                    |
-                       |                                              | • Dedicated Write-Capable Role              |
-                       |                                              | • Explicit ACID Transaction (BEGIN/COMMIT)  |
-                       |                                              | • Automatic Rollback on Any Failure         |
-                       +------------------------------+---------------+---------------------------------------------+
-                                                      |
-                                                      v
-                                  +---------------------------------------+
-                                  |   📝 Append-Only Audit Trail (SQLite) |
-                                  |  • Reads: Plans, Latency, Token Cost  |
-                                  |  • Writes: User, Mutating SQL, Rows   |
-                                  +---------------------------------------+
+```mermaid
+flowchart TD
+    subgraph ClientLayer["🖥️ Client Interface"]
+        UI["Streamlit Web UI (app/ui.py)"]
+        API["REST API Clients (cURL / Swagger / SDK)"]
+    end
+
+    subgraph AuthLayer["🔐 Gateway, Authentication & Rate Limiting"]
+        AuthGate["FastAPI Gateway (app/main.py)"]
+        JWTMgr["JWT Bearer Auth & Token Decode (app/auth.py)"]
+        RateLimiter["Sliding Window Rate Limiter (app/rate_limiter.py)"]
+    end
+
+    subgraph BYODB["📂 Multi-Tenant BYODB Connection Manager"]
+        ConnRegistry["Connection Registry & Dialect Resolver (app/connections.py)"]
+        Crypto["AES-256 Fernet Symmetric Encryption (app/crypto.py)"]
+        UserConns[("SQLite Auth & Connections DB (app/models.py)")]
+    end
+
+    subgraph LLMRouterLayer["🔌 Multi-LLM Fallback Router (app/llm.py)"]
+        Router["LLM Router (Priority Failover Chain)"]
+        Anthropic["Anthropic Claude 3.5 Sonnet"]
+        OpenAI["OpenAI GPT-4o / GPT-4o-mini"]
+        Gemini["Google Gemini 1.5 Pro / Flash"]
+        Groq["Groq Llama 3.3 70B"]
+    end
+
+    subgraph ReadPath["📖 Guarded Read Pipeline (POST /ask)"]
+        direction TB
+        Memory["Multi-Turn Session Memory (app/memory.py)"]
+        Grounding["Isolated Grounding & Retrieval (app/retrieval.py)\n• Dynamic Schema-Linking\n• Distinct Value Hints\n• Few-Shot Golden Queries"]
+        PlanRead["SQL Planning Agent (app/agent.py)"]
+        ReadAST["Read-Only AST Validator (sqlglot)\n• Rejects DML/DDL\n• Blocks Multiple Statements & Forbidden Functions"]
+        ReadDB["Read-Only Database Engine (sql_readonly role)"]
+        SelfCorrect{"Dialect / Execution Error?"}
+        Synthesizer["Natural Language Synthesizer (app/agent.py)"]
+    end
+
+    subgraph WritePath["✍️ Two-Phase Opt-In Write Pipeline"]
+        direction TB
+        WriteGate{"allow_writes == True?"}
+        PlanWrite["Write Planning Agent (app/agent.py)"]
+        WriteAST["Write AST Validator (sqlglot)\n• Only INSERT / UPDATE / DELETE\n• Mandatory WHERE Clause on UPDATE/DELETE"]
+        PreviewGen["Dry-Run Preview Generator (Read-Only DB)\n• Formats SELECT preview for UPDATE/DELETE"]
+        MintToken["Mint 5-Minute Signed Preview Token with JTI (POST /ask/write)"]
+        ConfirmGate["Confirm & Single-Use JTI Check (POST /ask/write/confirm)"]
+        WriteDB["Dedicated Write Database Engine\n• Explicit Transaction (BEGIN ... COMMIT)\n• Automatic ROLLBACK on failure"]
+    end
+
+    subgraph AuditLayer["📝 Async Audit & Compliance Layer (app/audit.py)"]
+        AuditDB[("Append-Only SQLite Audit DB\n• Latency, Tokens, Cost, Queries\n• User-Scoped Filtered Compliance Logs\n• Single-Use JTI Store")]
+    end
+
+    %% Client to Gateway
+    UI --> AuthGate
+    API --> AuthGate
+
+    %% Gateway to Auth and BYODB
+    AuthGate --> RateLimiter
+    RateLimiter --> JWTMgr
+    JWTMgr --> ConnRegistry
+    ConnRegistry <--> Crypto
+    ConnRegistry <--> UserConns
+
+    %% Routing to Read or Write
+    ConnRegistry -->|Query Request| ReadPath
+    ConnRegistry -->|Mutating Request| WriteGate
+
+    %% LLM Router Connections
+    PlanRead <--> Router
+    PlanWrite <--> Router
+    Synthesizer <--> Router
+    Router --> Anthropic
+    Anthropic -. Failover .-> OpenAI
+    OpenAI -. Failover .-> Gemini
+    Gemini -. Failover .-> Groq
+
+    %% Read Path Flow
+    Memory --> PlanRead
+    Grounding --> PlanRead
+    PlanRead --> ReadAST
+    ReadAST -->|Valid SELECT| ReadDB
+    ReadDB --> SelfCorrect
+    SelfCorrect -->|Error & Retries Left| PlanRead
+    SelfCorrect -->|Success| Synthesizer
+    Synthesizer --> UI
+    Synthesizer --> API
+
+    %% Write Path Flow
+    WriteGate -->|Yes| PlanWrite
+    WriteGate -->|No| RejectWrite["403 Forbidden: Writes Disabled"]
+    PlanWrite --> WriteAST
+    WriteAST --> PreviewGen
+    PreviewGen --> MintToken
+    MintToken --> UI
+    MintToken --> API
+    UI -. User Approval .-> ConfirmGate
+    ConfirmGate --> WriteAST
+    ConfirmGate --> WriteDB
+
+    %% Audit Logging
+    ReadDB -. Log Attempt .-> AuditDB
+    WriteDB -. Log Mutation .-> AuditDB
+    ConfirmGate -. Mark JTI Consumed .-> AuditDB
 ```
 
 ---
@@ -315,23 +366,9 @@ The system is built on a strict defense-in-depth model that guarantees tenant is
 
 ---
 
-## 🗺️ Roadmap
-
-- [x] **Core Text-to-SQL Agent**: Self-correction loop with sqlglot AST verification and natural language synthesis.
-- [x] **3-Layer Anti-Hallucination Grounding**: Dynamic schema-linking, column value hinting, and few-shot golden queries.
-- [x] **Dialect Enforcement**: Syntax and function validation across PostgreSQL, SQLite, MySQL, and Snowflake.
-- [x] **Conversational Memory**: Multi-turn context tracking and pronoun/reference resolution.
-- [x] **Interactive Streamlit Web UI**: Visible reasoning trace expander, interactive dataframes, and auto-charting.
-- [x] **Automated Benchmark Harness**: Execution Accuracy (EX) evaluation suite and CI gate threshold enforcement.
-- [x] **Multi-LLM Fallback Router**: Priority-ordered failover across Anthropic, OpenAI, Gemini, and Groq.
-- [x] **Multi-Tenant Auth & BYODB**: JWT authentication, AES-256 credential encryption, connection testing, and isolated schema vector indexes.
-- [x] **Safe Opt-In Write Operations**: Two-phase preview and transaction confirmation flow for INSERT/UPDATE/DELETE with mandatory WHERE clauses.
-
----
-
 ## 🧪 Testing
 
-Run the full test suite with pytest (51 unit & integration tests):
+Run the full test suite with pytest (61 unit & integration tests):
 ```bash
 pytest -v -o asyncio_mode=auto
 ```
