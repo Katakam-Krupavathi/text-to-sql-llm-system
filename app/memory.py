@@ -16,12 +16,13 @@ class ConversationTurn:
 
 
 class ConversationMemoryStore:
-    """In-memory store holding recent conversation turns per session."""
+    """In-memory store holding recent conversation turns per session with optional user ownership scoping."""
 
     def __init__(self, max_turns_per_session: int = 5, session_ttl_seconds: int = 3600):
         self.max_turns = max_turns_per_session
         self.session_ttl = session_ttl_seconds
         self.sessions: Dict[str, List[ConversationTurn]] = defaultdict(list)
+        self.session_owners: Dict[str, str] = {}
 
     def get_or_create_session_id(self, session_id: Optional[str] = None) -> str:
         if session_id and session_id.strip():
@@ -35,8 +36,9 @@ class ConversationMemoryStore:
         reasoning_plan: Optional[str],
         sql_query: Optional[str],
         answer: str,
+        user_id: Optional[str] = None,
     ) -> None:
-        """Adds a completed turn to the session history."""
+        """Adds a completed turn to the session history, binding it to the user if provided."""
         self._cleanup_old_turns(session_id)
         turn = ConversationTurn(
             question=question,
@@ -45,6 +47,8 @@ class ConversationMemoryStore:
             answer=answer,
         )
         self.sessions[session_id].append(turn)
+        if user_id:
+            self.session_owners[session_id] = user_id
 
         # Enforce max turns
         if len(self.sessions[session_id]) > self.max_turns:
@@ -73,9 +77,22 @@ class ConversationMemoryStore:
         
         return "\n".join(history_lines) + "\n\n"
 
-    def clear_session(self, session_id: str) -> None:
-        if session_id in self.sessions:
-            del self.sessions[session_id]
+    def clear_session(self, session_id: str, user_id: Optional[str] = None) -> bool:
+        """
+        Clears conversation memory for a specific session.
+        If user_id is provided, verifies that the session belongs to that user.
+        Returns True if cleared, False if session not found or user unauthorized.
+        """
+        if session_id not in self.sessions:
+            return False
+
+        if user_id and session_id in self.session_owners:
+            if self.session_owners[session_id] != user_id:
+                return False
+
+        del self.sessions[session_id]
+        self.session_owners.pop(session_id, None)
+        return True
 
     def _cleanup_old_turns(self, session_id: str):
         cutoff = time.time() - self.session_ttl
@@ -85,6 +102,7 @@ class ConversationMemoryStore:
             ]
             if not self.sessions[session_id]:
                 del self.sessions[session_id]
+                self.session_owners.pop(session_id, None)
 
 
 # Global in-memory conversation memory instance

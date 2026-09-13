@@ -8,7 +8,20 @@ from app.main import app
 from app.memory import ConversationMemoryStore, memory_store
 from app.validator import validate_and_normalize_sql
 
-client = TestClient(app)
+from app.config import settings
+from app.models import init_auth_db
+
+@pytest.fixture(autouse=True)
+def setup_clean_env(tmp_path, monkeypatch):
+    """Ensures each test gets an isolated auth database."""
+    test_auth_db = str(tmp_path / "test_auth_memory.db")
+    monkeypatch.setattr(settings, "AUTH_DB_PATH", test_auth_db)
+    init_auth_db()
+
+
+@pytest.fixture
+def client():
+    return TestClient(app)
 
 
 def test_memory_store_turn_tracking():
@@ -115,7 +128,7 @@ async def test_session_isolation():
     assert history_b == ""  # Session B has no knowledge of Session A
 
 
-def test_ask_endpoint_with_session_id():
+def test_ask_endpoint_with_session_id(client):
     mock_plan = json.dumps({
         "reasoning_plan": "Count customers",
         "sql_dialect": "postgres",
@@ -141,3 +154,43 @@ def test_ask_endpoint_with_session_id():
         data = response.json()
         assert data["session_id"] == "api-sess-123"
         assert data["answer"] == mock_synth
+
+
+def test_delete_session_auth_and_ownership(client):
+    # 1. Unauthenticated DELETE returns 401
+    unauth_resp = client.delete("/sessions/test-session-auth")
+    assert unauth_resp.status_code == 401
+
+    # 2. Register user 1 and user 2
+    reg1 = client.post("/auth/register", json={"email": "mem_user1@example.com", "password": "Password123!"})
+    token1 = reg1.json()["access_token"]
+    user1_id = reg1.json()["user_id"]
+    headers1 = {"Authorization": f"Bearer {token1}"}
+
+    reg2 = client.post("/auth/register", json={"email": "mem_user2@example.com", "password": "Password123!"})
+    token2 = reg2.json()["access_token"]
+    user2_id = reg2.json()["user_id"]
+    headers2 = {"Authorization": f"Bearer {token2}"}
+
+    # Add a turn to session owned by user 1
+    session_id = "user1-private-session"
+    memory_store.add_turn(
+        session_id=session_id,
+        question="User 1 private question",
+        reasoning_plan="plan",
+        sql_query="SELECT 1;",
+        answer="answer",
+        user_id=user1_id,
+    )
+
+    # 3. User 2 attempts to delete User 1's session -> 404
+    del_resp_u2 = client.delete(f"/sessions/{session_id}", headers=headers2)
+    assert del_resp_u2.status_code == 404
+    # Check session still exists in memory
+    assert len(memory_store.get_recent_history(session_id)) == 1
+
+    # 4. User 1 deletes their own session -> 200
+    del_resp_u1 = client.delete(f"/sessions/{session_id}", headers=headers1)
+    assert del_resp_u1.status_code == 200
+    assert len(memory_store.get_recent_history(session_id)) == 0
+

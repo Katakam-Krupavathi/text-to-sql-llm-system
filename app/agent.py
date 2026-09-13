@@ -103,7 +103,7 @@ Previous Attempt Failed:
 Please review the error carefully, diagnose what went wrong in your previous SQL or dialect syntax, and produce a corrected plan and SQL query.
 """
 
-    raw_response = await llm_client.generate(prompt=prompt, system_prompt=system_prompt)
+    raw_response = await llm_client.generate(prompt=prompt, system_prompt=system_prompt, response_format="json")
     data = clean_json_response(raw_response)
 
     if "sql_query" not in data or "reasoning_plan" not in data:
@@ -182,7 +182,7 @@ Previous Attempt Failed:
 Please review the error carefully and produce a corrected mutating SQL query.
 """
 
-    raw_response = await llm_client.generate(prompt=prompt, system_prompt=system_prompt)
+    raw_response = await llm_client.generate(prompt=prompt, system_prompt=system_prompt, response_format="json")
     data = clean_json_response(raw_response)
 
     if "sql_query" not in data or "reasoning_plan" not in data:
@@ -329,7 +329,12 @@ async def execute_sql(
         }
 
 
-async def synthesize_answer(question: str, columns: List[str], rows: List[Dict[str, Any]]) -> str:
+async def synthesize_answer(
+    question: str,
+    columns: List[str],
+    rows: List[Dict[str, Any]],
+    response_format: Optional[str] = None,
+) -> str:
     """Step 4: Produces a natural-language answer summarizing the query result."""
     system_prompt = """You are a helpful data analyst. Given a user's question and the SQL query results, synthesize a clear, direct, and concise natural language answer.
 - Answer the user's question directly in standard English.
@@ -348,7 +353,7 @@ Query Results ({total_count} total rows, showing up to 20):
 
 Synthesized Natural Language Answer:"""
 
-    response = await llm_client.generate(prompt=prompt, system_prompt=system_prompt)
+    response = await llm_client.generate(prompt=prompt, system_prompt=system_prompt, response_format=response_format)
     return response.strip()
 
 
@@ -359,6 +364,7 @@ async def answer_question(
     connection_string: Optional[str] = None,
     dialect: Optional[str] = None,
     max_retries: int = settings.MAX_RETRIES,
+    user_id: Optional[str] = None,
 ) -> dict:
     """Step 3: Orchestrator loop managing memory, planning, AST validation, execution, self-correction, and audit."""
     start_total_time = time.time()
@@ -404,7 +410,7 @@ async def answer_question(
                 "success": False,
                 "error": error_msg,
             })
-            audit_logger.log_attempt(
+            await audit_logger.log_attempt(
                 question=question,
                 attempt=attempt,
                 reasoning_plan=None,
@@ -415,6 +421,7 @@ async def answer_question(
                 execution_success=False,
                 error_message=error_msg,
                 latency_ms=latency_ms,
+                user_id=user_id,
             )
             error_context = error_msg
             continue
@@ -449,7 +456,7 @@ async def answer_question(
         }
         sql_attempts.append(attempt_trace)
 
-        audit_logger.log_attempt(
+        await audit_logger.log_attempt(
             question=question,
             attempt=attempt,
             reasoning_plan=reasoning_plan,
@@ -462,6 +469,7 @@ async def answer_question(
             latency_ms=latency_ms,
             tokens_used=step_tokens,
             cost_usd=step_cost,
+            user_id=user_id,
         )
 
         if exec_result["success"]:
@@ -482,6 +490,7 @@ async def answer_question(
                 reasoning_plan=reasoning_plan,
                 sql_query=final_sql,
                 answer=answer_text,
+                user_id=user_id,
             )
 
             return {

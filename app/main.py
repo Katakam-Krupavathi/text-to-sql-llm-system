@@ -172,7 +172,7 @@ async def get_optional_current_user(
         payload = decode_access_token(auth.credentials)
         user_id = payload.get("sub")
         if user_id:
-            return get_user_by_id(user_id)
+            return await get_user_by_id(user_id)
     except Exception:
         pass
     return None
@@ -209,12 +209,12 @@ async def health_check():
 @app.post("/auth/register", response_model=TokenResponse)
 async def register(req: RegisterRequest):
     """Registers a new user account and returns a JWT access token."""
-    existing = get_user_by_email(req.email)
+    existing = await get_user_by_email(req.email)
     if existing:
         raise HTTPException(status_code=400, detail="User with this email already exists.")
     
     hashed = hash_password(req.password)
-    user = create_user(email=req.email, hashed_password=hashed)
+    user = await create_user(email=req.email, hashed_password=hashed)
     token = create_access_token({"sub": user["id"], "email": user["email"]})
     return TokenResponse(
         access_token=token,
@@ -227,7 +227,7 @@ async def register(req: RegisterRequest):
 @app.post("/auth/login", response_model=TokenResponse)
 async def login(req: LoginRequest):
     """Authenticates a user and returns a JWT access token."""
-    user = get_user_by_email(req.email)
+    user = await get_user_by_email(req.email)
     if not user or not verify_password(req.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
     
@@ -271,7 +271,7 @@ async def create_connection(
     encrypted_str = encrypt_connection_string(req.connection_string)
 
     # 3. Save connection record in DB
-    record = create_database_connection(
+    record = await create_database_connection(
         user_id=current_user["id"],
         nickname=req.nickname,
         dialect=req.dialect,
@@ -304,7 +304,7 @@ async def create_connection(
 @app.get("/connections", response_model=List[ConnectionResponse])
 async def list_connections(current_user: dict = Depends(get_current_user)):
     """Lists all database connections owned by the current user."""
-    conns = get_connections_for_user(current_user["id"])
+    conns = await get_connections_for_user(current_user["id"])
     return [ConnectionResponse(**c) for c in conns]
 
 
@@ -314,7 +314,7 @@ async def delete_connection(
     current_user: dict = Depends(get_current_user),
 ):
     """Deletes a database connection and purges its cached schema index."""
-    deleted = delete_database_connection(connection_id, current_user["id"])
+    deleted = await delete_database_connection(connection_id, current_user["id"])
     if not deleted:
         raise HTTPException(status_code=404, detail="Connection not found.")
 
@@ -339,7 +339,7 @@ async def ask(
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required to query custom connection.")
         
-        conn_record = get_connection_by_id(request.connection_id)
+        conn_record = await get_connection_by_id(request.connection_id)
         if not conn_record or conn_record["user_id"] != current_user["id"]:
             raise HTTPException(status_code=404, detail="Connection not found or access denied.")
         
@@ -347,10 +347,11 @@ async def ask(
         target_dialect = conn_record["dialect"]
         target_conn_id = conn_record["id"]
     elif current_user:
-        # Default to user's first registered connection if available
-        user_conns = get_connections_for_user(current_user["id"])
+        # Default to user's first registered connection (sorted by created_at ascending) if available
+        user_conns = await get_connections_for_user(current_user["id"])
         if user_conns:
-            first_conn = get_connection_by_id(user_conns[0]["id"])
+            earliest_conn = sorted(user_conns, key=lambda c: c["created_at"])[0]
+            first_conn = await get_connection_by_id(earliest_conn["id"])
             if first_conn:
                 target_conn_str = decrypt_connection_string(first_conn["encrypted_connection_string"])
                 target_dialect = first_conn["dialect"]
@@ -364,6 +365,7 @@ async def ask(
             connection_string=target_conn_str,
             dialect=target_dialect,
             max_retries=request.max_retries or settings.MAX_RETRIES,
+            user_id=current_user["id"] if current_user else None,
         )
         return AskResponse(
             session_id=result["session_id"],
@@ -397,7 +399,7 @@ async def ask_write(
     target_engine = readonly_engine
 
     if request.connection_id:
-        conn_record = get_connection_by_id(request.connection_id)
+        conn_record = await get_connection_by_id(request.connection_id)
         if not conn_record or conn_record["user_id"] != current_user["id"]:
             raise HTTPException(status_code=404, detail="Connection not found or access denied.")
         if not conn_record.get("allow_writes", False):
@@ -411,9 +413,10 @@ async def ask_write(
         target_engine = get_engine_for_connection(target_conn_id, target_conn_str)
         db_target = f"connection:{target_conn_id}"
     else:
-        user_conns = get_connections_for_user(current_user["id"])
+        user_conns = await get_connections_for_user(current_user["id"])
         if user_conns:
-            first_conn = get_connection_by_id(user_conns[0]["id"])
+            earliest_conn = sorted(user_conns, key=lambda c: c["created_at"])[0]
+            first_conn = await get_connection_by_id(earliest_conn["id"])
             if first_conn:
                 if not first_conn.get("allow_writes", False):
                     raise HTTPException(
@@ -515,7 +518,7 @@ async def confirm_write(
     jti = payload.get("jti") or str(uuid.uuid4())
 
     # Check and enforce single-use token consumption
-    if not audit_logger.consume_preview_token(jti, current_user["id"], sql_to_execute):
+    if not await audit_logger.consume_preview_token(jti, current_user["id"], sql_to_execute):
         raise HTTPException(
             status_code=409,
             detail="This write has already been executed or is being processed.",
@@ -523,7 +526,7 @@ async def confirm_write(
 
     # 2. Resolve write-capable database connection
     if target_conn_id:
-        conn_record = get_connection_by_id(target_conn_id)
+        conn_record = await get_connection_by_id(target_conn_id)
         if not conn_record or conn_record["user_id"] != current_user["id"]:
             raise HTTPException(status_code=404, detail="Target connection not found or access denied.")
         if not conn_record.get("allow_writes", False):
@@ -580,7 +583,7 @@ async def confirm_write(
                 is_estimate = True
 
         latency_ms = (time.time() - start_t) * 1000.0
-        audit_logger.log_write_execution(
+        await audit_logger.log_write_execution(
             user_id=current_user["id"],
             sql_query=normalized_sql,
             sql_dialect=target_dialect,
@@ -600,7 +603,7 @@ async def confirm_write(
         latency_ms = (time.time() - start_t) * 1000.0
         err_msg = str(e)
         logger.error(f"Write transaction failed for query '{normalized_sql}': {err_msg}")
-        audit_logger.log_write_execution(
+        await audit_logger.log_write_execution(
             user_id=current_user["id"],
             sql_query=normalized_sql,
             sql_dialect=target_dialect,
@@ -613,14 +616,23 @@ async def confirm_write(
 
 
 @app.get("/audit")
-async def get_audit_logs(limit: int = 50):
-    """Fetches recent audit log records for compliance review."""
-    return {"logs": audit_logger.get_recent_logs(limit=limit)}
+async def get_audit_logs(
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user),
+):
+    """Fetches recent audit log records for compliance review (scoped to authenticated user)."""
+    logs = await audit_logger.get_recent_logs(limit=limit, user_id=current_user["id"])
+    return {"logs": logs}
 
 
 @app.delete("/sessions/{session_id}")
-async def clear_session(session_id: str):
-    """Clears conversation memory for a specific session."""
-    memory_store.clear_session(session_id)
+async def clear_session(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Clears conversation memory for a specific session owned by the authenticated user."""
+    cleared = memory_store.clear_session(session_id, user_id=current_user["id"])
+    if not cleared:
+        raise HTTPException(status_code=404, detail="Session not found or access denied.")
     return {"message": f"Session {session_id} memory cleared."}
 

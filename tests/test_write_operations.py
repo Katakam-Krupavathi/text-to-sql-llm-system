@@ -188,7 +188,7 @@ def test_confirm_write_commits_transaction(client, temp_write_db):
     assert new_price == 850.0
 
     # Verify audit log recorded the write execution
-    recent_logs = audit_logger.get_recent_logs(limit=5)
+    recent_logs = audit_logger.get_recent_logs_sync(limit=5)
     write_logs = [log for log in recent_logs if log.get("is_write") == 1]
     assert len(write_logs) >= 1
     assert "UPDATE products SET price = 850" in write_logs[0]["sql_query"]

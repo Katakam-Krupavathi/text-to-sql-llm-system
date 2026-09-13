@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str = "gpt-4o"
 
     ANTHROPIC_API_KEY: Optional[str] = None
-    ANTHROPIC_MODEL: str = "claude-3-5-sonnet-20240620"
+    ANTHROPIC_MODEL: str = "claude-3-5-sonnet-20241022"
 
     GEMINI_API_KEY: Optional[str] = None
     GEMINI_MODEL: str = "gemini-1.5-pro"

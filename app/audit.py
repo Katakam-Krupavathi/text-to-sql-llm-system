@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 import json
 import logging
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 MODEL_PRICING_PER_1K = {
     "gpt-4o": {"prompt": 0.005, "completion": 0.015},
     "gpt-4o-mini": {"prompt": 0.00015, "completion": 0.0006},
+    "claude-3-5-sonnet-20241022": {"prompt": 0.003, "completion": 0.015},
     "claude-3-5-sonnet-20240620": {"prompt": 0.003, "completion": 0.015},
     "claude-3-haiku-20240307": {"prompt": 0.00025, "completion": 0.00125},
 }
@@ -31,7 +33,7 @@ def calculate_cost(prompt_tokens: int, completion_tokens: int, model: str = sett
 
 
 class AuditLogger:
-    """Maintains an append-only SQLite database for audit and compliance."""
+    """Maintains an append-only SQLite database for audit and compliance using async-safe operations."""
 
     def __init__(self, db_path: str = settings.AUDIT_LOG_DB_PATH):
         self.db_path = db_path
@@ -63,10 +65,6 @@ class AuditLogger:
                         affected_rows INTEGER DEFAULT 0
                     );
                 """)
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);")
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_success ON audit_logs(execution_success);")
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_is_write ON audit_logs(is_write);")
-
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS consumed_tokens (
                         jti TEXT PRIMARY KEY,
@@ -75,8 +73,6 @@ class AuditLogger:
                         sql_query TEXT
                     );
                 """)
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_consumed_at ON consumed_tokens(consumed_at);")
-                
                 # Migrations for existing DB files
                 for col_def in [
                     ("is_write", "BOOLEAN DEFAULT 0"),
@@ -87,11 +83,17 @@ class AuditLogger:
                         cursor.execute(f"ALTER TABLE audit_logs ADD COLUMN {col_def[0]} {col_def[1]}")
                     except sqlite3.OperationalError:
                         pass
+
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_success ON audit_logs(execution_success);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_is_write ON audit_logs(is_write);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_user_id ON audit_logs(user_id);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_consumed_at ON consumed_tokens(consumed_at);")
                 conn.commit()
         except Exception as e:
             logger.warning(f"Could not initialize SQLite audit database at {self.db_path}: {e}")
 
-    def log_attempt(
+    def _sync_log_attempt(
         self,
         question: str,
         attempt: int,
@@ -109,7 +111,7 @@ class AuditLogger:
         user_id: Optional[str] = None,
         affected_rows: int = 0,
     ) -> None:
-        """Appends a structured log entry into the SQLite audit table."""
+        """Appends a structured log entry synchronously into the SQLite audit table."""
         timestamp_str = datetime.now(timezone.utc).isoformat()
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -146,7 +148,15 @@ class AuditLogger:
         except Exception as e:
             logger.error(f"Failed to record audit log: {e}")
 
-    def log_write_execution(
+    async def log_attempt(self, *args, **kwargs) -> None:
+        """Async-safe non-blocking wrapper to record audit log attempts."""
+        await asyncio.to_thread(self._sync_log_attempt, *args, **kwargs)
+
+    def log_attempt_sync(self, *args, **kwargs) -> None:
+        """Synchronous wrapper for log_attempt."""
+        self._sync_log_attempt(*args, **kwargs)
+
+    def _sync_log_write_execution(
         self,
         user_id: str,
         sql_query: str,
@@ -156,7 +166,7 @@ class AuditLogger:
         error_message: Optional[str] = None,
         latency_ms: float = 0.0,
     ) -> None:
-        """Appends an explicit write-operation confirmation log entry."""
+        """Appends an explicit write-operation confirmation log entry synchronously."""
         timestamp_str = datetime.now(timezone.utc).isoformat()
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -193,11 +203,16 @@ class AuditLogger:
         except Exception as e:
             logger.error(f"Failed to record write audit log: {e}")
 
-    def consume_preview_token(self, jti: str, user_id: str, sql_query: str) -> bool:
-        """
-        Atomically marks a preview token (jti) as consumed.
-        Returns True if successful, or False if the token was already consumed (IntegrityError).
-        """
+    async def log_write_execution(self, *args, **kwargs) -> None:
+        """Async-safe non-blocking wrapper to record write execution audit records."""
+        await asyncio.to_thread(self._sync_log_write_execution, *args, **kwargs)
+
+    def log_write_execution_sync(self, *args, **kwargs) -> None:
+        """Synchronous wrapper for log_write_execution."""
+        self._sync_log_write_execution(*args, **kwargs)
+
+    def _sync_consume_preview_token(self, jti: str, user_id: str, sql_query: str) -> bool:
+        """Atomically marks a preview token (jti) as consumed synchronously."""
         timestamp_str = datetime.now(timezone.utc).isoformat()
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -217,19 +232,42 @@ class AuditLogger:
             logger.error(f"Failed to record consumed token: {e}")
             return False
 
-    def get_recent_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Retrieves recent audit logs."""
+    async def consume_preview_token(self, jti: str, user_id: str, sql_query: str) -> bool:
+        """Async-safe non-blocking token consumption check."""
+        return await asyncio.to_thread(self._sync_consume_preview_token, jti, user_id, sql_query)
+
+    def consume_preview_token_sync(self, jti: str, user_id: str, sql_query: str) -> bool:
+        """Synchronous wrapper for consume_preview_token."""
+        return self._sync_consume_preview_token(jti, user_id, sql_query)
+
+    def _sync_get_recent_logs(self, limit: int = 50, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieves recent audit logs synchronously, optionally filtered by user_id."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
-                cursor.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,))
+                if user_id:
+                    cursor.execute(
+                        "SELECT * FROM audit_logs WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+                        (user_id, limit),
+                    )
+                else:
+                    cursor.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,))
                 rows = cursor.fetchall()
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Failed to fetch audit logs: {e}")
             return []
 
+    async def get_recent_logs(self, limit: int = 50, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Async-safe non-blocking retrieval of recent audit logs."""
+        return await asyncio.to_thread(self._sync_get_recent_logs, limit, user_id)
+
+    def get_recent_logs_sync(self, limit: int = 50, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Synchronous wrapper for get_recent_logs."""
+        return self._sync_get_recent_logs(limit, user_id)
+
 
 # Global audit logger instance
 audit_logger = AuditLogger()
+

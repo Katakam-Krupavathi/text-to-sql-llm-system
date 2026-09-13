@@ -235,3 +235,47 @@ async def test_multi_tenant_connection_and_schema_isolation(client, temp_dbs):
         headers=headers_a,
     )
     assert after_del_resp.status_code in [403, 404]
+
+
+def test_default_connection_selection_picks_earliest(client, temp_dbs):
+    """Verifies that when connection_id is omitted, the user's earliest created connection is chosen."""
+    url_a, url_b = temp_dbs
+
+    res = client.post("/auth/register", json={"email": "multi_conn_user@example.com", "password": "password123"})
+    token = res.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Register first connection (Clinic DB - url_a)
+    conn1_resp = client.post(
+        "/connections",
+        json={"nickname": "First Registered Clinic DB", "dialect": "sqlite", "connection_string": url_a},
+        headers=headers,
+    )
+    assert conn1_resp.status_code == 200
+    conn1_id = conn1_resp.json()["id"]
+
+    # Register second connection (School DB - url_b)
+    conn2_resp = client.post(
+        "/connections",
+        json={"nickname": "Second Registered School DB", "dialect": "sqlite", "connection_string": url_b},
+        headers=headers,
+    )
+    assert conn2_resp.status_code == 200
+
+    # Query without connection_id -> should route to first registered connection (Clinic DB / patients)
+    with patch("app.agent.llm_client.generate", new_callable=AsyncMock) as mock_llm:
+        mock_llm.side_effect = [
+            '{"reasoning_plan": "Query default clinic DB", "sql_dialect": "sqlite", "sql_query": "SELECT full_name FROM patients;"}',
+            "There are 2 patients.",
+        ]
+
+        resp = client.post(
+            "/ask",
+            json={"question": "List all patients"},
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["rows"]) == 2
+        assert "full_name" in data["rows"][0]
+

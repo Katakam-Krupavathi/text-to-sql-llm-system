@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import os
 import sqlite3
@@ -52,7 +53,7 @@ def init_auth_db():
 init_auth_db()
 
 
-def create_user(email: str, hashed_password: str) -> dict:
+def _sync_create_user(email: str, hashed_password: str) -> dict:
     user_id = str(uuid.uuid4())
     created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     conn = _get_connection()
@@ -71,7 +72,16 @@ def create_user(email: str, hashed_password: str) -> dict:
         conn.close()
 
 
-def get_user_by_email(email: str) -> Optional[dict]:
+async def create_user(email: str, hashed_password: str) -> dict:
+    """Async-safe creation of user record."""
+    return await asyncio.to_thread(_sync_create_user, email, hashed_password)
+
+
+def create_user_sync(email: str, hashed_password: str) -> dict:
+    return _sync_create_user(email, hashed_password)
+
+
+def _sync_get_user_by_email(email: str) -> Optional[dict]:
     conn = _get_connection()
     try:
         cursor = conn.cursor()
@@ -84,7 +94,16 @@ def get_user_by_email(email: str) -> Optional[dict]:
         conn.close()
 
 
-def get_user_by_id(user_id: str) -> Optional[dict]:
+async def get_user_by_email(email: str) -> Optional[dict]:
+    """Async-safe retrieval of user by email."""
+    return await asyncio.to_thread(_sync_get_user_by_email, email)
+
+
+def get_user_by_email_sync(email: str) -> Optional[dict]:
+    return _sync_get_user_by_email(email)
+
+
+def _sync_get_user_by_id(user_id: str) -> Optional[dict]:
     conn = _get_connection()
     try:
         cursor = conn.cursor()
@@ -97,7 +116,16 @@ def get_user_by_id(user_id: str) -> Optional[dict]:
         conn.close()
 
 
-def create_database_connection(
+async def get_user_by_id(user_id: str) -> Optional[dict]:
+    """Async-safe retrieval of user by ID."""
+    return await asyncio.to_thread(_sync_get_user_by_id, user_id)
+
+
+def get_user_by_id_sync(user_id: str) -> Optional[dict]:
+    return _sync_get_user_by_id(user_id)
+
+
+def _sync_create_database_connection(
     user_id: str,
     nickname: str,
     dialect: str,
@@ -142,7 +170,45 @@ def create_database_connection(
         conn.close()
 
 
-def get_connections_for_user(user_id: str) -> List[dict]:
+async def create_database_connection(
+    user_id: str,
+    nickname: str,
+    dialect: str,
+    encrypted_connection_string: str,
+    is_read_only: bool = True,
+    allow_writes: bool = False,
+) -> dict:
+    """Async-safe creation of user database connection record."""
+    return await asyncio.to_thread(
+        _sync_create_database_connection,
+        user_id,
+        nickname,
+        dialect,
+        encrypted_connection_string,
+        is_read_only,
+        allow_writes,
+    )
+
+
+def create_database_connection_sync(
+    user_id: str,
+    nickname: str,
+    dialect: str,
+    encrypted_connection_string: str,
+    is_read_only: bool = True,
+    allow_writes: bool = False,
+) -> dict:
+    return _sync_create_database_connection(
+        user_id,
+        nickname,
+        dialect,
+        encrypted_connection_string,
+        is_read_only,
+        allow_writes,
+    )
+
+
+def _sync_get_connections_for_user(user_id: str) -> List[dict]:
     conn = _get_connection()
     try:
         cursor = conn.cursor()
@@ -173,7 +239,16 @@ def get_connections_for_user(user_id: str) -> List[dict]:
         conn.close()
 
 
-def get_connection_by_id(connection_id: str) -> Optional[dict]:
+async def get_connections_for_user(user_id: str) -> List[dict]:
+    """Async-safe retrieval of connections belonging to user."""
+    return await asyncio.to_thread(_sync_get_connections_for_user, user_id)
+
+
+def get_connections_for_user_sync(user_id: str) -> List[dict]:
+    return _sync_get_connections_for_user(user_id)
+
+
+def _sync_get_connection_by_id(connection_id: str) -> Optional[dict]:
     conn = _get_connection()
     try:
         cursor = conn.cursor()
@@ -189,7 +264,16 @@ def get_connection_by_id(connection_id: str) -> Optional[dict]:
         conn.close()
 
 
-def delete_database_connection(connection_id: str, user_id: str) -> bool:
+async def get_connection_by_id(connection_id: str) -> Optional[dict]:
+    """Async-safe retrieval of connection by ID."""
+    return await asyncio.to_thread(_sync_get_connection_by_id, connection_id)
+
+
+def get_connection_by_id_sync(connection_id: str) -> Optional[dict]:
+    return _sync_get_connection_by_id(connection_id)
+
+
+def _sync_delete_database_connection(connection_id: str, user_id: str) -> bool:
     conn = _get_connection()
     try:
         with conn:
@@ -201,3 +285,13 @@ def delete_database_connection(connection_id: str, user_id: str) -> bool:
             return cursor.rowcount > 0
     finally:
         conn.close()
+
+
+async def delete_database_connection(connection_id: str, user_id: str) -> bool:
+    """Async-safe deletion of user database connection."""
+    return await asyncio.to_thread(_sync_delete_database_connection, connection_id, user_id)
+
+
+def delete_database_connection_sync(connection_id: str, user_id: str) -> bool:
+    return _sync_delete_database_connection(connection_id, user_id)
+

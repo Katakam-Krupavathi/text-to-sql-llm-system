@@ -7,10 +7,26 @@ from fastapi.testclient import TestClient
 from app.agent import answer_question, execute_sql, plan
 from app.audit import audit_logger, calculate_cost, estimate_tokens
 from app.main import app
+from app.config import settings
+from app.models import init_auth_db
 from app.rate_limiter import SlidingWindowRateLimiter
 from app.validator import validate_and_normalize_sql
 
-client = TestClient(app)
+@pytest.fixture(autouse=True)
+def setup_clean_env(tmp_path, monkeypatch):
+    """Ensures each test gets an isolated auth database and audit database."""
+    test_auth_db = str(tmp_path / "test_auth_safety.db")
+    test_audit_db = str(tmp_path / "test_audit_safety.db")
+    monkeypatch.setattr(settings, "AUTH_DB_PATH", test_auth_db)
+    monkeypatch.setattr(settings, "AUDIT_LOG_DB_PATH", test_audit_db)
+    init_auth_db()
+    audit_logger.db_path = test_audit_db
+    audit_logger._init_db()
+
+
+@pytest.fixture
+def client():
+    return TestClient(app)
 
 
 # --- 1. Adversarial & Malicious Query Blocking Tests ---
@@ -156,7 +172,7 @@ def test_token_and_cost_estimation():
 
 
 def test_audit_logger_records_attempt():
-    audit_logger.log_attempt(
+    audit_logger.log_attempt_sync(
         question="What is the stock of Chai?",
         attempt=1,
         reasoning_plan="Check units_in_stock for Chai",
@@ -170,12 +186,93 @@ def test_audit_logger_records_attempt():
         cost_usd=0.00045,
     )
 
-    recent_logs = audit_logger.get_recent_logs(limit=10)
+    recent_logs = audit_logger.get_recent_logs_sync(limit=10)
     assert len(recent_logs) > 0
     latest = recent_logs[0]
     assert latest["question"] == "What is the stock of Chai?"
     assert latest["execution_success"] in (1, True)
     assert latest["sql_dialect"] == "postgres"
+
+
+@pytest.mark.asyncio
+async def test_audit_logger_async_methods():
+    await audit_logger.log_attempt(
+        question="Async test question",
+        attempt=1,
+        reasoning_plan="Async plan",
+        sql_query="SELECT 1;",
+        sql_dialect="postgres",
+        dialect_valid=True,
+        ast_valid=True,
+        execution_success=True,
+        latency_ms=10.0,
+        tokens_used=50,
+        cost_usd=0.0001,
+        user_id="user-async-123",
+    )
+    logs = await audit_logger.get_recent_logs(limit=10, user_id="user-async-123")
+    assert len(logs) >= 1
+    assert logs[0]["user_id"] == "user-async-123"
+
+
+def test_audit_endpoint_requires_auth_and_filters_user(client):
+    # 1. Unauthenticated request returns 401
+    unauth_resp = client.get("/audit")
+    assert unauth_resp.status_code == 401
+
+    # 2. Register user 1
+    reg1 = client.post("/auth/register", json={"email": "audit_user1@example.com", "password": "Password123!"})
+    token1 = reg1.json()["access_token"]
+    user1_id = reg1.json()["user_id"]
+    headers1 = {"Authorization": f"Bearer {token1}"}
+
+    # Register user 2
+    reg2 = client.post("/auth/register", json={"email": "audit_user2@example.com", "password": "Password123!"})
+    token2 = reg2.json()["access_token"]
+    user2_id = reg2.json()["user_id"]
+    headers2 = {"Authorization": f"Bearer {token2}"}
+
+    # Log attempt for user 1
+    audit_logger.log_attempt_sync(
+        question="User 1 query",
+        attempt=1,
+        reasoning_plan="plan",
+        sql_query="SELECT 1;",
+        sql_dialect="postgres",
+        dialect_valid=True,
+        ast_valid=True,
+        execution_success=True,
+        user_id=user1_id,
+    )
+
+    # Log attempt for user 2
+    audit_logger.log_attempt_sync(
+        question="User 2 query",
+        attempt=1,
+        reasoning_plan="plan",
+        sql_query="SELECT 2;",
+        sql_dialect="postgres",
+        dialect_valid=True,
+        ast_valid=True,
+        execution_success=True,
+        user_id=user2_id,
+    )
+
+    # User 1 queries /audit: gets only user 1's logs
+    resp1 = client.get("/audit", headers=headers1)
+    assert resp1.status_code == 200
+    logs1 = resp1.json()["logs"]
+    assert len(logs1) >= 1
+    assert all(log["user_id"] == user1_id for log in logs1)
+    assert any(log["question"] == "User 1 query" for log in logs1)
+
+    # User 2 queries /audit: gets only user 2's logs
+    resp2 = client.get("/audit", headers=headers2)
+    assert resp2.status_code == 200
+    logs2 = resp2.json()["logs"]
+    assert len(logs2) >= 1
+    assert all(log["user_id"] == user2_id for log in logs2)
+    assert any(log["question"] == "User 2 query" for log in logs2)
 
 
 # --- 5. Production Security Keys Startup Check ---
