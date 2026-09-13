@@ -382,4 +382,70 @@ def test_allow_default_db_writes_gate(client, monkeypatch):
         assert claims["db_target"] == "default_db"
 
 
+def test_affected_rows_fallback_from_ast(client, temp_write_db):
+    """Verifies that when rowcount is unavailable (-1 or None), INSERT statement rows are estimated from AST."""
+    db_uri, db_file = temp_write_db
+
+    reg_resp = client.post("/auth/register", json={"email": "ast_rowcount_user@example.com", "password": "Password123!"})
+    token = reg_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    conn_resp = client.post(
+        "/connections",
+        json={"nickname": "Inventory DB", "dialect": "sqlite", "connection_string": db_uri, "allow_writes": True},
+        headers=headers,
+    )
+    conn_id = conn_resp.json()["id"]
+
+    insert_sql = "INSERT INTO products (product_id, name, price, stock) VALUES (10, 'Webcam', 49.99, 5), (11, 'Headset', 59.99, 12)"
+    mock_plan = {
+        "reasoning_plan": "Insert two new accessories",
+        "sql_dialect": "sqlite",
+        "sql_query": insert_sql,
+    }
+
+    with patch("app.main.plan_write", new=AsyncMock(return_value=mock_plan)):
+        preview_resp = client.post(
+            "/ask/write",
+            json={"question": "Add Webcam and Headset", "connection_id": conn_id},
+            headers=headers,
+        )
+        assert preview_resp.status_code == 200
+        preview_token = preview_resp.json()["preview_token"]
+
+    # 1. Normal execution: rowcount is reported by sqlite driver (affected_rows_is_estimate is False)
+    confirm_resp = client.post("/ask/write/confirm", json={"preview_token": preview_token}, headers=headers)
+    assert confirm_resp.status_code == 200
+    res_data = confirm_resp.json()
+    assert res_data["affected_rows"] == 2
+    assert res_data["affected_rows_is_estimate"] is False
+
+    # 2. Simulated driver where rowcount is -1 or None: AST parsing calculates 2 rows and sets is_estimate=True
+    insert_sql_2 = "INSERT INTO products (product_id, name, price, stock) VALUES (20, 'Desk', 299.99, 2), (21, 'Chair', 199.99, 4), (22, 'Lamp', 39.99, 10)"
+    mock_plan_2 = {
+        "reasoning_plan": "Insert three items",
+        "sql_dialect": "sqlite",
+        "sql_query": insert_sql_2,
+    }
+    with patch("app.main.plan_write", new=AsyncMock(return_value=mock_plan_2)):
+        preview_resp_2 = client.post(
+            "/ask/write",
+            json={"question": "Add Desk, Chair, Lamp", "connection_id": conn_id},
+            headers=headers,
+        )
+        preview_token_2 = preview_resp_2.json()["preview_token"]
+
+    class MockResult:
+        rowcount = -1
+
+    original_engine = app.state if hasattr(app, "state") else None
+    with patch("sqlalchemy.ext.asyncio.AsyncConnection.execute", new=AsyncMock(return_value=MockResult())):
+        confirm_resp_2 = client.post("/ask/write/confirm", json={"preview_token": preview_token_2}, headers=headers)
+        assert confirm_resp_2.status_code == 200
+        res_data_2 = confirm_resp_2.json()
+        assert res_data_2["affected_rows"] == 3
+        assert res_data_2["affected_rows_is_estimate"] is True
+
+
+
 

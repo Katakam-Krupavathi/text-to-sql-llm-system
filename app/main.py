@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field
 from sqlalchemy import text
+import sqlglot
+from sqlglot import exp
 
 from app.agent import answer_question, generate_write_preview, plan_write
 from app.audit import audit_logger
@@ -156,6 +158,7 @@ class ConfirmWriteResponse(BaseModel):
     status: str = "committed"
     sql: str
     affected_rows: int
+    affected_rows_is_estimate: bool = False
     timestamp: str
 
 
@@ -556,7 +559,25 @@ async def confirm_write(
     try:
         async with write_engine.begin() as conn:
             result = await conn.execute(text(normalized_sql))
-            affected_rows = result.rowcount if hasattr(result, "rowcount") and result.rowcount is not None and result.rowcount >= 0 else 1
+            raw_rowcount = getattr(result, "rowcount", None)
+            if raw_rowcount is not None and raw_rowcount >= 0:
+                affected_rows = raw_rowcount
+                is_estimate = False
+            else:
+                dialect_for_parsing = target_dialect if target_dialect in ("postgres", "sqlite", "mysql") else "postgres"
+                try:
+                    parsed = sqlglot.parse_one(normalized_sql, read=dialect_for_parsing)
+                    if parsed and isinstance(parsed, exp.Insert):
+                        values_node = parsed.find(exp.Values)
+                        if values_node and values_node.expressions:
+                            affected_rows = len(values_node.expressions)
+                        else:
+                            affected_rows = 1
+                    else:
+                        affected_rows = 1
+                except Exception:
+                    affected_rows = 1
+                is_estimate = True
 
         latency_ms = (time.time() - start_t) * 1000.0
         audit_logger.log_write_execution(
@@ -572,6 +593,7 @@ async def confirm_write(
             status="committed",
             sql=normalized_sql,
             affected_rows=affected_rows,
+            affected_rows_is_estimate=is_estimate,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
     except Exception as e:
