@@ -75,7 +75,7 @@ def send_query_to_backend(question: str, session_id: str, connection_id: Optiona
         else:
             return None, f"Backend Error ({resp.status_code}): {resp.text}"
     except httpx.ConnectError:
-        return None, "Could not connect to FastAPI backend at http://localhost:8000. Please make sure the server is running (`uvicorn app.main:app --port 8000`)."
+        return None, f"Could not connect to FastAPI backend at {API_BASE_URL}. Please make sure the server is running (`uvicorn app.main:app --port 8000`)."
     except Exception as e:
         return None, f"Unexpected error: {str(e)}"
 
@@ -90,8 +90,8 @@ with st.sidebar:
         st.success(f"🟢 Backend Online ({health.get('dialect', 'postgres').upper()})")
         st.caption(f"Model: `{health.get('llm_model', 'gpt-4o')}` | Dialect: `{health.get('dialect')}`")
     else:
-        st.error("🔴 Backend Offline (http://localhost:8000)")
-        st.caption("Start with: `uvicorn app.main:app --reload --port 8000`")
+        st.error(f"🔴 Backend Offline ({API_BASE_URL})")
+        st.caption(f"Start with: `uvicorn app.main:app --reload` (Target: `{API_BASE_URL}`)")
 
     st.divider()
 
