@@ -255,3 +255,52 @@ def test_write_rejected_when_allow_writes_is_false(client, temp_write_db):
     )
     assert write_resp.status_code == 403
     assert "Write operations are disabled" in write_resp.json()["detail"]
+
+
+def test_preview_token_replay_rejected(client, temp_write_db):
+    """Confirming the same preview_token twice is rejected with 409 and does not execute SQL twice."""
+    db_uri, db_file = temp_write_db
+
+    reg_resp = client.post("/auth/register", json={"email": "replay_user@example.com", "password": "Password123!"})
+    token = reg_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    conn_resp = client.post(
+        "/connections",
+        json={"nickname": "Inventory DB", "dialect": "sqlite", "connection_string": db_uri, "allow_writes": True},
+        headers=headers,
+    )
+    conn_id = conn_resp.json()["id"]
+
+    mock_plan = {
+        "reasoning_plan": "Increment stock for Laptop by 10",
+        "sql_dialect": "sqlite",
+        "sql_query": "UPDATE products SET stock = stock + 10 WHERE product_id = 1",
+    }
+    with patch("app.main.plan_write", new=AsyncMock(return_value=mock_plan)):
+        preview_resp = client.post(
+            "/ask/write",
+            json={"question": "Add 10 to Laptop stock", "connection_id": conn_id},
+            headers=headers,
+        )
+        assert preview_resp.status_code == 200
+        preview_token = preview_resp.json()["preview_token"]
+
+    # First execution succeeds
+    first_resp = client.post("/ask/write/confirm", json={"preview_token": preview_token}, headers=headers)
+    assert first_resp.status_code == 200
+    assert first_resp.json()["status"] == "committed"
+
+    # Second execution of same preview_token MUST fail with 409 Conflict
+    second_resp = client.post("/ask/write/confirm", json={"preview_token": preview_token}, headers=headers)
+    assert second_resp.status_code == 409
+    assert "already been executed" in second_resp.json()["detail"]
+
+    # Verify stock only increased once (10 -> 20, not 30)
+    conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+    cursor.execute("SELECT stock FROM products WHERE product_id = 1")
+    final_stock = cursor.fetchone()[0]
+    conn.close()
+    assert final_stock == 20
+

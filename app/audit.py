@@ -66,6 +66,16 @@ class AuditLogger:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_success ON audit_logs(execution_success);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_is_write ON audit_logs(is_write);")
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS consumed_tokens (
+                        jti TEXT PRIMARY KEY,
+                        consumed_at TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        sql_query TEXT
+                    );
+                """)
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_consumed_at ON consumed_tokens(consumed_at);")
                 
                 # Migrations for existing DB files
                 for col_def in [
@@ -182,6 +192,30 @@ class AuditLogger:
                 conn.commit()
         except Exception as e:
             logger.error(f"Failed to record write audit log: {e}")
+
+    def consume_preview_token(self, jti: str, user_id: str, sql_query: str) -> bool:
+        """
+        Atomically marks a preview token (jti) as consumed.
+        Returns True if successful, or False if the token was already consumed (IntegrityError).
+        """
+        timestamp_str = datetime.now(timezone.utc).isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO consumed_tokens (jti, consumed_at, user_id, sql_query)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (jti, timestamp_str, user_id, sql_query),
+                )
+                conn.commit()
+                return True
+        except sqlite3.IntegrityError:
+            return False
+        except Exception as e:
+            logger.error(f"Failed to record consumed token: {e}")
+            return False
 
     def get_recent_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Retrieves recent audit logs."""

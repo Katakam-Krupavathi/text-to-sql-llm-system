@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import time
 from typing import Any, Dict, List, Optional
+import uuid
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError, jwt
@@ -454,6 +455,7 @@ async def ask_write(
 
     # 4. Generate 5-minute cryptographically signed preview token
     token_payload = {
+        "jti": str(uuid.uuid4()),
         "sub": current_user["id"],
         "connection_id": target_conn_id,
         "sql": normalized_sql,
@@ -495,6 +497,14 @@ async def confirm_write(
 
     sql_to_execute = payload.get("sql")
     target_conn_id = payload.get("connection_id")
+    jti = payload.get("jti") or str(uuid.uuid4())
+
+    # Check and enforce single-use token consumption
+    if not audit_logger.consume_preview_token(jti, current_user["id"], sql_to_execute):
+        raise HTTPException(
+            status_code=409,
+            detail="This write has already been executed or is being processed.",
+        )
 
     # 2. Resolve write-capable database connection
     if target_conn_id:
