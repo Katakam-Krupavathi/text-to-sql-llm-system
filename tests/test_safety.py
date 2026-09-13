@@ -176,3 +176,28 @@ def test_audit_logger_records_attempt():
     assert latest["question"] == "What is the stock of Chai?"
     assert latest["execution_success"] in (1, True)
     assert latest["sql_dialect"] == "postgres"
+
+
+# --- 5. Production Security Keys Startup Check ---
+
+def test_security_keys_production_startup_validation():
+    """Asserts app fails to start with default keys when DEBUG=False, and starts fine with warning when DEBUG=True."""
+    from app.config import validate_security_keys, Settings
+
+    # 1. DEBUG=False with default SECRET_KEY -> Raises RuntimeError
+    prod_settings = Settings(DEBUG=False, SECRET_KEY="super-secret-text-to-sql-jwt-key-change-in-production")
+    with pytest.raises(RuntimeError, match="Production startup blocked"):
+        validate_security_keys(prod_settings)
+
+    # 2. DEBUG=False with unique secure keys -> Passes without error
+    secure_prod_settings = Settings(
+        DEBUG=False,
+        SECRET_KEY="totally-unique-production-random-secret-key-12345",
+        ENCRYPTION_KEY="custom-unique-encryption-key-for-prod",
+    )
+    validate_security_keys(secure_prod_settings)
+
+    # 3. DEBUG=True with default keys -> Passes (logs dev warning)
+    dev_settings = Settings(DEBUG=True, SECRET_KEY="super-secret-text-to-sql-jwt-key-change-in-production")
+    validate_security_keys(dev_settings)
+

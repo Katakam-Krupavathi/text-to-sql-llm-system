@@ -13,7 +13,7 @@ from sqlalchemy import text
 from app.agent import answer_question, generate_write_preview, plan_write
 from app.audit import audit_logger
 from app.auth import create_access_token, get_current_user, hash_password, verify_password, security_bearer, decode_access_token
-from app.config import settings
+from app.config import settings, validate_security_keys
 from app.connections import (
     close_engine_for_connection,
     get_engine_for_connection,
@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_security_keys(settings)
     logger.info(f"Starting {settings.APP_NAME} (Dialect: {settings.SQL_DIALECT})")
     yield
     logger.info("Shutting down database engines...")

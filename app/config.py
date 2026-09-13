@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     # App
     APP_NAME: str = "text-to-sql-agent"
-    DEBUG: bool = False
+    DEBUG: bool = True
 
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/text_to_sql_db"
@@ -93,8 +93,45 @@ class Settings(BaseSettings):
             key = self.get_provider_api_key(p_clean)
             if key and key.strip():
                 eligible.append(p_clean)
-        # If no provider has a key configured, return the provider order as fallback (for mock/test environments)
         return eligible if eligible else order
+
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+KNOWN_DEFAULT_SECRET_KEYS = {
+    "super-secret-text-to-sql-jwt-key-change-in-production",
+    "change-this-jwt-secret-in-production",
+    "secret",
+    "default",
+}
+
+KNOWN_DEFAULT_ENCRYPTION_KEYS = {
+    "0G2t7L4D3tM-0fN7V8zL9kP1mQ2wE4rT6yU8iO0pA1s=",
+}
+
+
+def validate_security_keys(settings_obj: Settings) -> None:
+    """
+    Validates that SECRET_KEY and ENCRYPTION_KEY are not using known example/dev values in production.
+    Raises RuntimeError when DEBUG is False and defaults are detected.
+    Logs a loud warning when DEBUG is True.
+    """
+    is_default_secret = settings_obj.SECRET_KEY in KNOWN_DEFAULT_SECRET_KEYS
+    is_default_encryption = settings_obj.ENCRYPTION_KEY in KNOWN_DEFAULT_ENCRYPTION_KEYS
+
+    if is_default_secret or is_default_encryption:
+        msg = (
+            "Default/insecure SECRET_KEY or ENCRYPTION_KEY detected. "
+            "Set a unique, cryptographically secure ENCRYPTION_KEY and SECRET_KEY before running in production."
+        )
+        if not settings_obj.DEBUG:
+            raise RuntimeError(
+                f"Production startup blocked: {msg} (Set DEBUG=true for local development/testing)."
+            )
+        else:
+            logger.warning(f"⚠️ [DEV SECURITY WARNING] {msg}")
 
 
 @lru_cache()
