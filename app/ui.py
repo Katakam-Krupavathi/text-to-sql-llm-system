@@ -188,128 +188,133 @@ def confirm_write_in_backend(preview_token: str, auth_token: Optional[str] = Non
 with st.sidebar:
     st.title("⚙️ Agent Settings")
     
-    # Backend Health Status
-    health = check_backend_health()
-    if health:
-        st.success(f"🟢 Backend Online ({health.get('dialect', 'postgres').upper()})")
-        st.caption(f"Model: `{health.get('llm_model', 'gpt-4o')}` | Dialect: `{health.get('dialect')}`")
-    else:
-        st.error(f"🔴 Backend Offline ({API_BASE_URL})")
-        st.caption(f"Start with: `uvicorn app.main:app --reload` (Target: `{API_BASE_URL}`)")
-
-    st.divider()
-
-    # Multi-Tenant Auth Section
-    st.subheader("🔐 User Authentication")
-    if st.session_state.auth_token:
-        user_display = st.session_state.user_email if st.session_state.user_email else "Authenticated User"
-        st.success(f"👤 **{user_display}**")
-        if st.button("🚪 Log Out", key="logout_btn", use_container_width=True):
-            st.session_state.auth_token = ""
-            st.session_state.user_email = ""
-            st.session_state.selected_connection_id = None
-            st.rerun()
-
-        with st.expander("🔑 Advanced: Active Bearer Token", expanded=False):
-            st.code(st.session_state.auth_token, language="text")
-            new_jwt = st.text_input("Replace Token", value=st.session_state.auth_token, type="password", key="active_jwt_replace")
-            if new_jwt != st.session_state.auth_token:
-                st.session_state.auth_token = new_jwt
-                st.rerun()
-    else:
-        tab_login, tab_register = st.tabs(["Log In", "Register"])
-        with tab_login:
-            with st.form("login_form"):
-                login_email = st.text_input("Email", placeholder="user@example.com", key="login_email")
-                login_pwd = st.text_input("Password", type="password", placeholder="••••••••", key="login_pwd")
-                login_btn = st.form_submit_button("Log In", type="primary", use_container_width=True)
-                if login_btn:
-                    if not login_email or not login_pwd:
-                        st.error("Please enter both email and password.")
-                    else:
-                        data, err = auth_login(login_email, login_pwd)
-                        if err:
-                            st.error(f"Login failed: {err}")
-                        elif data:
-                            st.session_state.auth_token = data.get("access_token", "")
-                            st.session_state.user_email = data.get("email", login_email)
-                            st.rerun()
-
-        with tab_register:
-            with st.form("register_form"):
-                reg_email = st.text_input("Email", placeholder="user@example.com", key="reg_email")
-                reg_pwd = st.text_input("Password (min 6 chars)", type="password", placeholder="••••••••", key="reg_pwd")
-                reg_btn = st.form_submit_button("Create Account", use_container_width=True)
-                if reg_btn:
-                    if not reg_email or not reg_pwd:
-                        st.error("Please enter email and password.")
-                    elif len(reg_pwd) < 6:
-                        st.error("Password must be at least 6 characters.")
-                    else:
-                        data, err = auth_register(reg_email, reg_pwd)
-                        if err:
-                            st.error(f"Registration failed: {err}")
-                        elif data:
-                            st.session_state.auth_token = data.get("access_token", "")
-                            st.session_state.user_email = data.get("email", reg_email)
-                            st.rerun()
-
-        with st.expander("🔑 Advanced: Paste a token directly", expanded=False):
-            raw_token = st.text_input(
-                "Paste JWT Bearer Token",
-                type="password",
-                help="Paste token from external auth",
-                key="raw_jwt_input",
-            )
-            if st.button("Apply Token", key="apply_raw_jwt_btn", use_container_width=True):
-                if raw_token.strip():
-                    st.session_state.auth_token = raw_token.strip()
-                    st.session_state.user_email = "Token User"
-                    st.rerun()
-
-    # Connection Picker
-    connections = fetch_user_connections(st.session_state.auth_token)
-    if connections:
-        conn_options = {f"{c['nickname']} ({c['dialect']})": c["id"] for c in connections}
-        selected_label = st.selectbox("Select Database Connection", options=list(conn_options.keys()))
-        st.session_state.selected_connection_id = conn_options.get(selected_label)
-        selected_conn = next((c for c in connections if c["id"] == st.session_state.selected_connection_id), None)
-        if selected_conn and not selected_conn.get("is_read_only", True):
-            st.warning("⚠️ Connection has write privileges. Read-only user recommended.")
-    else:
-        st.session_state.selected_connection_id = None
-        if st.session_state.auth_token:
-            st.caption("No registered connections found. Using default server database.")
+    # 1. Backend Health Status
+    with st.container(border=True):
+        st.subheader("🖥️ System Status")
+        health = check_backend_health()
+        if health:
+            st.success(f"🟢 **Backend Online** ({health.get('dialect', 'postgres').upper()})")
+            st.caption(f"Model: `{health.get('llm_model', 'gpt-4o')}` | Dialect: `{health.get('dialect')}`")
         else:
-            st.caption("Running in default server mode (or enter token to use BYODB).")
+            st.error(f"🔴 **Backend Offline** ({API_BASE_URL})")
+            st.caption(f"Start with: `uvicorn app.main:app --reload` (Target: `{API_BASE_URL}`)")
 
-    st.divider()
+    # 2. Multi-Tenant Auth Section
+    with st.container(border=True):
+        st.subheader("🔐 User Authentication")
+        if st.session_state.auth_token:
+            user_display = st.session_state.user_email if st.session_state.user_email else "Authenticated User"
+            st.success(f"👤 **{user_display}**")
+            if st.button("🚪 Log Out", key="logout_btn", use_container_width=True):
+                st.session_state.auth_token = ""
+                st.session_state.user_email = ""
+                st.session_state.selected_connection_id = None
+                st.rerun()
 
-    # Session Management
-    st.subheader("💬 Session Management")
-    st.code(st.session_state.session_id, language="text")
-    if st.button("🔄 New Conversation / Reset Memory", use_container_width=True):
-        try:
-            httpx.delete(f"{API_BASE_URL}/sessions/{st.session_state.session_id}", timeout=3.0)
-        except Exception:
-            pass
-        st.session_state.session_id = str(uuid.uuid4())
-        st.session_state.messages = []
-        st.rerun()
+            with st.expander("🔑 Advanced: Active Bearer Token", expanded=False):
+                st.code(st.session_state.auth_token, language="text")
+                new_jwt = st.text_input("Replace Token", value=st.session_state.auth_token, type="password", key="active_jwt_replace")
+                if new_jwt != st.session_state.auth_token:
+                    st.session_state.auth_token = new_jwt
+                    st.rerun()
+        else:
+            tab_login, tab_register = st.tabs(["Log In", "Register"])
+            with tab_login:
+                with st.form("login_form"):
+                    login_email = st.text_input("Email", placeholder="user@example.com", key="login_email")
+                    login_pwd = st.text_input("Password", type="password", placeholder="••••••••", key="login_pwd")
+                    login_btn = st.form_submit_button("Log In", type="primary", use_container_width=True)
+                    if login_btn:
+                        if not login_email or not login_pwd:
+                            st.error("Please enter both email and password.")
+                        else:
+                            data, err = auth_login(login_email, login_pwd)
+                            if err:
+                                st.error(f"Login failed: {err}")
+                            elif data:
+                                st.session_state.auth_token = data.get("access_token", "")
+                                st.session_state.user_email = data.get("email", login_email)
+                                st.rerun()
 
-    st.divider()
-    st.subheader("💡 Sample Questions")
-    sample_queries = [
-        "Which customers are located in Germany?",
-        "Now just show me those from Berlin",
-        "What is the total revenue by product category?",
-        "What are the top 5 most expensive products?",
-        "How many orders were placed in 2023?",
-    ]
-    for q in sample_queries:
-        if st.button(q, use_container_width=True):
-            st.session_state["preset_query"] = q
+            with tab_register:
+                with st.form("register_form"):
+                    reg_email = st.text_input("Email", placeholder="user@example.com", key="reg_email")
+                    reg_pwd = st.text_input("Password (min 6 chars)", type="password", placeholder="••••••••", key="reg_pwd")
+                    reg_btn = st.form_submit_button("Create Account", use_container_width=True)
+                    if reg_btn:
+                        if not reg_email or not reg_pwd:
+                            st.error("Please enter email and password.")
+                        elif len(reg_pwd) < 6:
+                            st.error("Password must be at least 6 characters.")
+                        else:
+                            data, err = auth_register(reg_email, reg_pwd)
+                            if err:
+                                st.error(f"Registration failed: {err}")
+                            elif data:
+                                st.session_state.auth_token = data.get("access_token", "")
+                                st.session_state.user_email = data.get("email", reg_email)
+                                st.rerun()
+
+            with st.expander("🔑 Advanced: Paste a token directly", expanded=False):
+                raw_token = st.text_input(
+                    "Paste JWT Bearer Token",
+                    type="password",
+                    help="Paste token from external auth",
+                    key="raw_jwt_input",
+                )
+                if st.button("Apply Token", key="apply_raw_jwt_btn", use_container_width=True):
+                    if raw_token.strip():
+                        st.session_state.auth_token = raw_token.strip()
+                        st.session_state.user_email = "Token User"
+                        st.rerun()
+
+    # 3. Connection Picker
+    with st.container(border=True):
+        st.subheader("🗄️ Database Connection")
+        connections = fetch_user_connections(st.session_state.auth_token)
+        if connections:
+            conn_options = {f"{c['nickname']} ({c['dialect']})": c["id"] for c in connections}
+            selected_label = st.selectbox("Select Active Connection", options=list(conn_options.keys()))
+            st.session_state.selected_connection_id = conn_options.get(selected_label)
+            selected_conn = next((c for c in connections if c["id"] == st.session_state.selected_connection_id), None)
+            if selected_conn:
+                if selected_conn.get("allow_writes", False):
+                    st.caption("⚡ **Write-capable connection**")
+                else:
+                    st.caption("🔒 **Read-only connection**")
+        else:
+            st.session_state.selected_connection_id = None
+            if st.session_state.auth_token:
+                st.caption("No registered user connections. Querying default server database.")
+            else:
+                st.caption("Default server database (log in to manage custom connections).")
+
+    # 4. Session Management
+    with st.container(border=True):
+        st.subheader("💬 Session Memory")
+        st.caption(f"Session ID: `{st.session_state.session_id[:8]}...`")
+        if st.button("🔄 Reset Memory & New Chat", use_container_width=True):
+            try:
+                httpx.delete(f"{API_BASE_URL}/sessions/{st.session_state.session_id}", timeout=3.0)
+            except Exception:
+                pass
+            st.session_state.session_id = str(uuid.uuid4())
+            st.session_state.messages = []
             st.rerun()
+
+    # 5. Collapsible Sample Questions Expander
+    with st.expander("💡 Sample Questions", expanded=False):
+        sample_queries = [
+            "Which customers are located in Germany?",
+            "Now just show me those from Berlin",
+            "What is the total revenue by product category?",
+            "What are the top 5 most expensive products?",
+            "How many orders were placed in 2023?",
+        ]
+        for q in sample_queries:
+            if st.button(q, use_container_width=True):
+                st.session_state["preset_query"] = q
+                st.rerun()
 
 
 def render_assistant_message(msg: dict):
