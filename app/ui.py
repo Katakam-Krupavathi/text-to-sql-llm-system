@@ -80,6 +80,75 @@ def send_query_to_backend(question: str, session_id: str, connection_id: Optiona
         return None, f"Unexpected error: {str(e)}"
 
 
+def send_write_query_to_backend(question: str, session_id: str, connection_id: Optional[str] = None, auth_token: Optional[str] = None):
+    try:
+        payload = {"question": question, "session_id": session_id}
+        if connection_id:
+            payload["connection_id"] = connection_id
+
+        headers = {}
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token.strip()}"
+
+        resp = httpx.post(f"{API_BASE_URL}/ask/write", json=payload, headers=headers, timeout=60.0)
+        if resp.status_code == 200:
+            return resp.json(), None
+        elif resp.status_code == 401:
+            return None, "Authentication required (HTTP 401). Please log in or provide a valid JWT token."
+        elif resp.status_code == 403:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            if "allow_writes" in detail or "disabled" in detail:
+                return None, "⚠️ Write operations are disabled for this database connection. Please edit your connection settings to enable writes (allow_writes=true), or switch to a write-enabled connection."
+            return None, f"Access denied (HTTP 403): {detail}"
+        elif resp.status_code == 429:
+            return None, "Rate limit exceeded (HTTP 429). Please wait a moment before sending another query."
+        else:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            return None, f"Write Planning Error ({resp.status_code}): {detail}"
+    except httpx.ConnectError:
+        return None, f"Could not connect to FastAPI backend at {API_BASE_URL}. Please make sure the server is running (`uvicorn app.main:app --port 8000`)."
+    except Exception as e:
+        return None, f"Unexpected error: {str(e)}"
+
+
+def confirm_write_in_backend(preview_token: str, auth_token: Optional[str] = None):
+    try:
+        payload = {"preview_token": preview_token}
+        headers = {}
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token.strip()}"
+
+        resp = httpx.post(f"{API_BASE_URL}/ask/write/confirm", json=payload, headers=headers, timeout=60.0)
+        if resp.status_code == 200:
+            return resp.json(), None
+        elif resp.status_code == 409:
+            return None, "⚠️ Replay Rejected: This write has already been executed or the preview token was already consumed."
+        elif resp.status_code == 401:
+            return None, "Authentication required (HTTP 401). Please log in."
+        elif resp.status_code == 403:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            return None, f"Forbidden (HTTP 403): {detail}"
+        else:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            return None, f"Write Execution Error ({resp.status_code}): {detail}"
+    except httpx.ConnectError:
+        return None, f"Could not connect to FastAPI backend at {API_BASE_URL}."
+    except Exception as e:
+        return None, f"Unexpected error: {str(e)}"
+
+
 # --- Sidebar ---
 with st.sidebar:
     st.title("⚙️ Agent Settings")
@@ -153,8 +222,77 @@ with st.sidebar:
 
 
 def render_assistant_message(msg: dict):
-    """Renders a structured assistant response including answer, metrics badge, reasoning trace, data table, and charts."""
-    # Primary synthesized answer
+    """Renders a structured assistant response including answer, metrics badge, reasoning trace, data table, charts, or write preview."""
+    # Write Operation Message
+    if msg.get("type") == "write_preview":
+        operation = msg.get("operation", "WRITE").upper()
+        status = msg.get("status", "pending")
+
+        if status == "pending":
+            st.warning(f"✍️ **Data Modification Plan Generated ({operation})** — Review preview below before executing.")
+        elif status == "confirmed":
+            est_flag = " (estimate)" if msg.get("affected_rows_is_estimate") else ""
+            st.success(
+                f"✅ **Write Committed Successfully** | Operation: `{operation}` | "
+                f"Affected Rows: **{msg.get('actual_affected_rows', 0)}{est_flag}** | "
+                f"Timestamp: `{msg.get('confirmed_at', '')}`\n\n"
+                f"🔒 *Transaction committed and recorded in immutable audit log.*"
+            )
+        elif status == "discarded":
+            st.info(f"ℹ️ **Write Operation Discarded** ({operation}). No database changes were applied.")
+        elif status == "failed":
+            st.error(f"❌ **Write Execution Failed**: {msg.get('confirm_error', 'Unknown transaction failure')}")
+
+        # Reasoning Plan & Generated SQL
+        with st.expander("🔍 Mutation Plan & Validated SQL", expanded=(status == "pending")):
+            if msg.get("reasoning_plan"):
+                st.markdown("**Reasoning Plan (Chain-of-Thought):**")
+                st.info(msg["reasoning_plan"])
+            if msg.get("sql_query"):
+                st.markdown("**Validated Mutating SQL:**")
+                st.code(msg["sql_query"], language="sql")
+
+        # Affected Rows Estimate Badge
+        est_count = msg.get("affected_count_estimate", 0)
+        st.caption(f"📊 **Estimated Affected Rows:** `{est_count}` | ⏳ Token expires in {msg.get('expires_in_seconds', 300)}s")
+
+        # Preview Dataframe
+        preview_rows = msg.get("preview_rows", [])
+        if preview_rows:
+            st.markdown("##### 🔍 Preview — nothing has been changed yet")
+            df = pd.DataFrame(preview_rows)
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.caption("No tabular preview rows returned for this statement.")
+
+        # Actions for Pending Write
+        if status == "pending":
+            st.divider()
+            col1, col2 = st.columns([2, 1])
+            preview_token = msg.get("preview_token", "")
+            with col1:
+                if st.button("🚀 Confirm & Execute Write", key=f"btn_confirm_{preview_token}", type="primary", use_container_width=True):
+                    with st.spinner("Executing transaction and logging audit trail..."):
+                        conf_res, conf_err = confirm_write_in_backend(
+                            preview_token=preview_token,
+                            auth_token=st.session_state.auth_token,
+                        )
+                    if conf_err:
+                        msg["status"] = "failed"
+                        msg["confirm_error"] = conf_err
+                    else:
+                        msg["status"] = "confirmed"
+                        msg["actual_affected_rows"] = conf_res.get("affected_rows", 0)
+                        msg["affected_rows_is_estimate"] = conf_res.get("affected_rows_is_estimate", False)
+                        msg["confirmed_at"] = conf_res.get("timestamp", "")
+                    st.rerun()
+            with col2:
+                if st.button("❌ Discard", key=f"btn_discard_{preview_token}", use_container_width=True):
+                    msg["status"] = "discarded"
+                    st.rerun()
+        return
+
+    # Primary synthesized answer for read path
     if msg.get("answer"):
         st.markdown(msg["answer"])
 
@@ -226,6 +364,16 @@ def render_assistant_message(msg: dict):
 st.title("🤖 Enterprise Text-to-SQL Agent")
 st.caption("Natural language SQL engine with AST safety guardrails, schema grounding, dialect enforcement, and multi-turn memory.")
 
+# Mode Toggle (Read-Only Query vs Data Modification)
+write_mode = st.toggle(
+    "✍️ Data Modification Mode (INSERT / UPDATE / DELETE)",
+    value=False,
+    help="When enabled, queries will be routed to the safe write path with a preview dry-run and explicit confirmation gate.",
+)
+
+if write_mode:
+    st.warning("⚠️ **Data Modification Mode Active**: Queries will be planned as mutating SQL operations. A preview will be shown for confirmation before any database changes occur.", icon="⚠️")
+
 # Render Chat History
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -236,7 +384,8 @@ for msg in st.session_state.messages:
 
 
 # Handle Chat Input (or Preset query)
-user_input = st.chat_input("Ask any question about your database (e.g. 'Show revenue by category')...")
+chat_placeholder = "Enter data modification request (e.g. 'Update stock to 50 for product 1')..." if write_mode else "Ask any question about your database (e.g. 'Show revenue by category')..."
+user_input = st.chat_input(chat_placeholder)
 if "preset_query" in st.session_state:
     user_input = st.session_state.pop("preset_query")
 
@@ -248,35 +397,71 @@ if user_input:
 
     # 2. Query Agent Backend with spinner
     with st.chat_message("assistant"):
-        with st.spinner("Analyzing schema, planning query, and executing safely..."):
-            response_data, error_msg = send_query_to_backend(
-                question=user_input,
-                session_id=st.session_state.session_id,
-                connection_id=st.session_state.selected_connection_id,
-                auth_token=st.session_state.auth_token,
-            )
+        if write_mode:
+            with st.spinner("Analyzing schema, planning safe write operation, and generating preview..."):
+                response_data, error_msg = send_write_query_to_backend(
+                    question=user_input,
+                    session_id=st.session_state.session_id,
+                    connection_id=st.session_state.selected_connection_id,
+                    auth_token=st.session_state.auth_token,
+                )
 
-        if error_msg:
-            st.error(error_msg)
-            st.session_state.messages.append({
-                "role": "assistant",
-                "answer": f"Error: {error_msg}",
-                "sql_attempts": [],
-                "final_sql": None,
-                "rows": [],
-                "columns": [],
-            })
-        elif response_data:
-            assistant_msg = {
-                "role": "assistant",
-                "answer": response_data["answer"],
-                "sql_attempts": response_data.get("sql_attempts", []),
-                "final_sql": response_data.get("final_sql"),
-                "rows": response_data.get("rows", []),
-                "columns": response_data.get("columns", []),
-                "total_tokens_used": response_data.get("total_tokens_used", 0),
-                "estimated_cost_usd": response_data.get("estimated_cost_usd", 0.0),
-                "total_latency_ms": response_data.get("total_latency_ms", 0.0),
-            }
-            render_assistant_message(assistant_msg)
-            st.session_state.messages.append(assistant_msg)
+            if error_msg:
+                st.error(error_msg)
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "answer": f"Write Error: {error_msg}",
+                    "sql_attempts": [],
+                    "final_sql": None,
+                    "rows": [],
+                    "columns": [],
+                })
+            elif response_data:
+                write_msg = {
+                    "role": "assistant",
+                    "type": "write_preview",
+                    "status": "pending",
+                    "preview_token": response_data.get("preview_token"),
+                    "operation": response_data.get("operation", "WRITE"),
+                    "sql_query": response_data.get("sql_query"),
+                    "reasoning_plan": response_data.get("reasoning_plan"),
+                    "preview_rows": response_data.get("preview_rows", []),
+                    "affected_count_estimate": response_data.get("affected_count_estimate", 0),
+                    "expires_in_seconds": response_data.get("expires_in_seconds", 300),
+                }
+                render_assistant_message(write_msg)
+                st.session_state.messages.append(write_msg)
+        else:
+            with st.spinner("Analyzing schema, planning query, and executing safely..."):
+                response_data, error_msg = send_query_to_backend(
+                    question=user_input,
+                    session_id=st.session_state.session_id,
+                    connection_id=st.session_state.selected_connection_id,
+                    auth_token=st.session_state.auth_token,
+                )
+
+            if error_msg:
+                st.error(error_msg)
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "answer": f"Error: {error_msg}",
+                    "sql_attempts": [],
+                    "final_sql": None,
+                    "rows": [],
+                    "columns": [],
+                })
+            elif response_data:
+                assistant_msg = {
+                    "role": "assistant",
+                    "type": "read",
+                    "answer": response_data["answer"],
+                    "sql_attempts": response_data.get("sql_attempts", []),
+                    "final_sql": response_data.get("final_sql"),
+                    "rows": response_data.get("rows", []),
+                    "columns": response_data.get("columns", []),
+                    "total_tokens_used": response_data.get("total_tokens_used", 0),
+                    "estimated_cost_usd": response_data.get("estimated_cost_usd", 0.0),
+                    "total_latency_ms": response_data.get("total_latency_ms", 0.0),
+                }
+                render_assistant_message(assistant_msg)
+                st.session_state.messages.append(assistant_msg)
