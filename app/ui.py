@@ -26,6 +26,9 @@ if "messages" not in st.session_state:
 if "auth_token" not in st.session_state:
     st.session_state.auth_token = ""
 
+if "user_email" not in st.session_state:
+    st.session_state.user_email = ""
+
 if "selected_connection_id" not in st.session_state:
     st.session_state.selected_connection_id = None
 
@@ -38,6 +41,38 @@ def check_backend_health():
         return None
     except Exception:
         return None
+
+
+def auth_login(email: str, password: str) -> Tuple[Optional[dict], Optional[str]]:
+    try:
+        resp = httpx.post(f"{API_BASE_URL}/auth/login", json={"email": email, "password": password}, timeout=10.0)
+        if resp.status_code == 200:
+            return resp.json(), None
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:
+            detail = resp.text
+        return None, detail
+    except httpx.ConnectError:
+        return None, f"Could not connect to backend at {API_BASE_URL}."
+    except Exception as e:
+        return None, str(e)
+
+
+def auth_register(email: str, password: str) -> Tuple[Optional[dict], Optional[str]]:
+    try:
+        resp = httpx.post(f"{API_BASE_URL}/auth/register", json={"email": email, "password": password}, timeout=10.0)
+        if resp.status_code == 200:
+            return resp.json(), None
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:
+            detail = resp.text
+        return None, detail
+    except httpx.ConnectError:
+        return None, f"Could not connect to backend at {API_BASE_URL}."
+    except Exception as e:
+        return None, str(e)
 
 
 def fetch_user_connections(auth_token: str):
@@ -164,17 +199,73 @@ with st.sidebar:
 
     st.divider()
 
-    # Multi-Tenant Auth & BYODB Section
-    st.subheader("🔐 Multi-Tenant Authentication")
-    jwt_input = st.text_input(
-        "JWT Bearer Token",
-        value=st.session_state.auth_token,
-        type="password",
-        help="Paste your JWT token from POST /auth/login or /auth/register",
-    )
-    if jwt_input != st.session_state.auth_token:
-        st.session_state.auth_token = jwt_input
-        st.rerun()
+    # Multi-Tenant Auth Section
+    st.subheader("🔐 User Authentication")
+    if st.session_state.auth_token:
+        user_display = st.session_state.user_email if st.session_state.user_email else "Authenticated User"
+        st.success(f"👤 **{user_display}**")
+        if st.button("🚪 Log Out", key="logout_btn", use_container_width=True):
+            st.session_state.auth_token = ""
+            st.session_state.user_email = ""
+            st.session_state.selected_connection_id = None
+            st.rerun()
+
+        with st.expander("🔑 Advanced: Active Bearer Token", expanded=False):
+            st.code(st.session_state.auth_token, language="text")
+            new_jwt = st.text_input("Replace Token", value=st.session_state.auth_token, type="password", key="active_jwt_replace")
+            if new_jwt != st.session_state.auth_token:
+                st.session_state.auth_token = new_jwt
+                st.rerun()
+    else:
+        tab_login, tab_register = st.tabs(["Log In", "Register"])
+        with tab_login:
+            with st.form("login_form"):
+                login_email = st.text_input("Email", placeholder="user@example.com", key="login_email")
+                login_pwd = st.text_input("Password", type="password", placeholder="••••••••", key="login_pwd")
+                login_btn = st.form_submit_button("Log In", type="primary", use_container_width=True)
+                if login_btn:
+                    if not login_email or not login_pwd:
+                        st.error("Please enter both email and password.")
+                    else:
+                        data, err = auth_login(login_email, login_pwd)
+                        if err:
+                            st.error(f"Login failed: {err}")
+                        elif data:
+                            st.session_state.auth_token = data.get("access_token", "")
+                            st.session_state.user_email = data.get("email", login_email)
+                            st.rerun()
+
+        with tab_register:
+            with st.form("register_form"):
+                reg_email = st.text_input("Email", placeholder="user@example.com", key="reg_email")
+                reg_pwd = st.text_input("Password (min 6 chars)", type="password", placeholder="••••••••", key="reg_pwd")
+                reg_btn = st.form_submit_button("Create Account", use_container_width=True)
+                if reg_btn:
+                    if not reg_email or not reg_pwd:
+                        st.error("Please enter email and password.")
+                    elif len(reg_pwd) < 6:
+                        st.error("Password must be at least 6 characters.")
+                    else:
+                        data, err = auth_register(reg_email, reg_pwd)
+                        if err:
+                            st.error(f"Registration failed: {err}")
+                        elif data:
+                            st.session_state.auth_token = data.get("access_token", "")
+                            st.session_state.user_email = data.get("email", reg_email)
+                            st.rerun()
+
+        with st.expander("🔑 Advanced: Paste a token directly", expanded=False):
+            raw_token = st.text_input(
+                "Paste JWT Bearer Token",
+                type="password",
+                help="Paste token from external auth",
+                key="raw_jwt_input",
+            )
+            if st.button("Apply Token", key="apply_raw_jwt_btn", use_container_width=True):
+                if raw_token.strip():
+                    st.session_state.auth_token = raw_token.strip()
+                    st.session_state.user_email = "Token User"
+                    st.rerun()
 
     # Connection Picker
     connections = fetch_user_connections(st.session_state.auth_token)
