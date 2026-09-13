@@ -65,6 +65,13 @@ jobs:
         run: |
           pytest -v -o asyncio_mode=auto
 
+      - name: UI Smoke & Boot Check
+        run: |
+          python -m py_compile app/ui.py
+          streamlit run app/ui.py --server.headless true --server.port 8501 &
+          sleep 5
+          curl --fail --retry 5 --retry-connrefused http://localhost:8501/_stcore/health
+
       - name: Run Execution Accuracy (EX) Benchmark
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
